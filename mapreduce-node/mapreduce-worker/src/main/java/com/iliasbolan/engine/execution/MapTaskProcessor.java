@@ -1,0 +1,247 @@
+package com.iliasbolan.engine.execution;
+
+import com.iliasbolan.core.*;
+import com.iliasbolan.engine.shuffle.ShufflePartitioner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.RecursiveAction;
+
+/**
+ * Executes the Map phase of a Map-Reduce job utilizing Java's Fork/Join Framework for
+ * optimal intra-node parallelism.
+ * <p>
+ * <b>Spill-to-Disk Memory Optimization:</b><br>
+ * Upgraded to a {@link RecursiveAction} to completely bypass in-memory list aggregation.
+ * By utilizing the {@link Context} streaming pattern, each thread processes its subset
+ * of data and delegates records dynamically to a thread-safe {@link ShufflePartitioner}.
+ * This guarantees a flat memory footprint regardless of chunk density.
+ * </p>
+ * <p>
+ * <b>Combiner / Local Reduction Phase:</b><br>
+ * If a Combiner is supplied, this processor transparently intercepts the micro-buffer
+ * immediately prior to disk spillage. It executes a local hash-based grouping and folds
+ * the values, drastically compressing the payload over the network shuffle.
+ * </p>
+ * <p>
+ * <b>Dynamic Resource Allocation:</b><br>
+ * Unlike traditional threaded applications with hardcoded thread counts, this processor is
+ * designed for cloud-native Kubernetes environments. It dynamically detects the container's
+ * available CPU limits using {@link Runtime#availableProcessors()}.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 3.2
+ * @see java.util.concurrent.RecursiveAction
+ * @see java.util.concurrent.ForkJoinPool
+ * @see com.iliasbolan.core.Mapper
+ * @see com.iliasbolan.core.Reducer
+ * @since 2026-04-24
+ */
+public class MapTaskProcessor extends RecursiveAction {
+
+    private static final Logger logger = LoggerFactory.getLogger(MapTaskProcessor.class);
+
+    /** The dynamically calculated maximum number of records a single thread should process sequentially. */
+    private final int threshold;
+
+    /** The subset of data records (e.g., lines of a file) to be processed. */
+    private final List<String> records;
+
+    /** The starting index (inclusive) of the records list assigned to this specific task. */
+    private final int start;
+
+    /** The ending index (exclusive) of the records list assigned to this specific task. */
+    private final int end;
+
+    /** The dynamically loaded user-defined Mapper implementation. */
+    private final Mapper mapper;
+
+    /** The optional user-defined Combiner implementation for local reduction optimizations. */
+    private final Combiner combiner;
+
+    /** The thread-safe partitioner responsible for spilling mapped data directly to local disk. */
+    private final ShufflePartitioner partitioner;
+
+    /**
+     * Constructs the ROOT {@code MapTaskProcessor} for a specific segment of the data chunk.
+     * <p>
+     * Initializes the root Fork/Join action for mapping records and spilling to disk.
+     * Calculates a dynamic split threshold based on available CPU cores to ensure
+     * proper fan-out. Binds a shared Partitioner to handle concurrent disk writes.
+     * </p>
+     *
+     * @param records     The complete list of UTF-8 records parsed from the chunk.
+     * @param start       The starting index for this task's segment.
+     * @param end         The ending index for this task's segment.
+     * @param mapper      The user's dynamic Mapper implementation.
+     * @param combiner    The optional Combiner (Reducer interface) for mid-stream aggregation. Can be null.
+     * @param partitioner The service handling concurrent disk spills.
+     */
+    public MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, Combiner combiner, ShufflePartitioner partitioner) {
+        this.records = records;
+        this.start = start;
+        this.end = end;
+        this.mapper = mapper;
+        this.combiner = combiner;
+        this.partitioner = partitioner;
+
+        // 1. Detect K8s CPU quota (Container Aware)
+        int vCpus = Runtime.getRuntime().availableProcessors();
+
+        // 2. Load Scaling Factor from environment (Allows 2.0x for I/O masking)
+        double factor = Double.parseDouble(System.getenv().getOrDefault("PARALLELISM_FACTOR", "2.0"));
+        int targetThreads = (int) Math.ceil(vCpus * factor);
+
+        // 3. Calculate Threshold to ensure enough tasks exist for work-stealing
+        // Aiming for ~12 tasks per target thread to keep the ForkJoinPool saturated.
+        this.threshold = Math.max(100, records.size() / (targetThreads * 12));
+
+        logger.info("Dynamic Parallelism discovery: [vCPUs: {}, Factor: {}, Target Threads: {}, Threshold: {}]",
+                vCpus, factor, targetThreads, this.threshold);
+    }
+
+    /**
+     * Internal constructor used exclusively for instantiating recursive sub-tasks.
+     * <p>
+     * Bypasses the heavy dynamic threshold calculation for sub-tasks to maximize performance.
+     * </p>
+     *
+     * @param records     The complete list of UTF-8 records parsed from the chunk.
+     * @param start       The starting index for this task's segment.
+     * @param end         The ending index for this task's segment.
+     * @param mapper      The user's dynamic Mapper implementation.
+     * @param combiner    The optional Combiner (Reducer interface) for mid-stream aggregation.
+     * @param partitioner The service handling concurrent disk spills.
+     * @param threshold   The calculated maximum number of records a single thread should process sequentially.
+     */
+    private MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, Combiner combiner, ShufflePartitioner partitioner, int threshold) {
+        this.records = records;
+        this.start = start;
+        this.end = end;
+        this.mapper = mapper;
+        this.combiner = combiner;
+        this.partitioner = partitioner;
+        this.threshold = threshold;
+    }
+
+    /**
+     * The core parallel computation method invoked by the {@link java.util.concurrent.ForkJoinPool}.
+     * <p>
+     * Recursively splits the workload in half until the segment size falls below the threshold.
+     * Because this is a RecursiveAction, no data is merged or returned. Threads execute
+     * their batches and flush to disk independently.
+     * </p>
+     */
+    @Override
+    protected void compute() {
+        int length = end - start;
+
+        // Base case: workload is small enough to process sequentially
+        if (length <= threshold) {
+            processSequentially();
+            return;
+        }
+
+        // Recursive case: split the workload in half
+        int middle = start + (length / 2);
+
+        MapTaskProcessor leftTask = new MapTaskProcessor(records, start, middle, mapper, combiner, partitioner, threshold);
+        MapTaskProcessor rightTask = new MapTaskProcessor(records, middle, end, mapper, combiner, partitioner, threshold);
+
+        // Fork the left task to run asynchronously on another thread
+        leftTask.fork();
+
+        // Compute the right task immediately on the current thread
+        rightTask.compute();
+
+        // Wait for the left task to complete
+        leftTask.join();
+    }
+
+    /**
+     * Iterates through the assigned segment of records, applies the Map logic, and flushes to disk.
+     * <p>
+     * Instantiates a dynamic streaming {@link Context} that flushes to the Partitioner
+     * periodically to prevent OutOfMemory errors on massive single records.
+     * </p>
+     *
+     * @throws RuntimeException If the disk spill operation fails.
+     */
+    private void processSequentially() {
+        // PERFORMANCE OPTIMIZATION: Pre-size the ArrayList to the exact micro-batch threshold.
+        // Prevents dynamic array reallocation (O(N) copying) as the buffer grows.
+        List<KeyValuePair> microBuffer = new ArrayList<>(5000);
+
+        // Create a local Context that streams directly to disk
+        Context streamingContext = (key, value) -> {
+            microBuffer.add(new KeyValuePair(key, value));
+
+            // MICRO-BATCH FLUSH: Keep memory entirely flat
+            if (microBuffer.size() >= 5000) {
+                flushToDisk(microBuffer);
+            }
+        };
+
+        for (int i = start; i < end; i++) {
+            String record = records.get(i);
+            // Apply user logic, streaming outputs back through the Context
+            mapper.map(record, streamingContext);
+        }
+
+        // Flush any remaining records after the loop ends
+        flushToDisk(microBuffer);
+    }
+
+    /**
+     * Intercepts the micro-buffer, applies local Combiner logic (if present), and safely
+     * flushes the highly compressed results to the thread-safe Partitioner.
+     *
+     * @param buffer The local list of mapped KeyValuePairs.
+     */
+    private void flushToDisk(List<KeyValuePair> buffer) {
+        if (buffer.isEmpty()) return;
+
+        try {
+            if (combiner == null) {
+                // Standard Pipeline: No Combiner, write raw Map outputs straight to disk
+                partitioner.appendThreadSafe(buffer);
+            } else {
+                // Optimization Pipeline: Combiner present, execute localized reduction
+                Map<String, List<String>> groupedRecords = new HashMap<>();
+
+                // 1. Group outputs by key locally
+                for (KeyValuePair kv : buffer) {
+                    groupedRecords.computeIfAbsent(kv.key(), k -> new ArrayList<>()).add(kv.value());
+                }
+
+                // 2. Prepare a new transient buffer to catch the Combiner's output
+                List<KeyValuePair> combinedBuffer = new ArrayList<>(groupedRecords.size());
+
+                // 3. Fold the data using the Combiner
+                for (Map.Entry<String, List<String>> entry : groupedRecords.entrySet()) {
+                    // Pass the Iterator required by the Reducer interface
+                    KeyValuePair result = combiner.combine(entry.getKey(), entry.getValue().iterator());
+
+                    if (result != null) {
+                        combinedBuffer.add(result);
+                    }
+                }
+
+                // 4. Spill the severely compressed payload to disk
+                partitioner.appendThreadSafe(combinedBuffer);
+            }
+
+            // Instantly free RAM for the next batch regardless of pipeline path
+            buffer.clear();
+
+        } catch (Exception e) {
+            logger.error("Failed to spill mapped records to disk", e);
+            throw new RuntimeException("Disk spill failed during Map phase", e);
+        }
+    }
+}

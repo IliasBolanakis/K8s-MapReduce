@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager-api
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: manager-api
+  template:
+    metadata:
+      labels:
+        app: manager-api
+    spec:
+      serviceAccountName: manager-service-account
+      containers:
+      - name: manager
+        image: mapreduce-manager:v1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        # --- Internal Kubernetes DNS Routing ---
+        - name: DATABASE_URL
+          value: "postgresql://postgres:DisSami2026!@postgres-service.default.svc.cluster.local:5432/dds_db"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-service.default.svc.cluster.local:5672/"
+        - name: REDIS_URL
+          value: "redis://redis-service.default.svc.cluster.local:6379/0"
+        - name: MINIO_ENDPOINT
+          value: "minio-service.default.svc.cluster.local:9000"
+        # --- Authentication Configuration ---
+        - name: ENABLE_AUTH
+          value: "true"
+        - name: JWT_PUBLIC_KEY
+          value: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Onzu2sDah1rptagWjEU0ZE2HVKwKxYRzdbnZmaMlQMI+UXv2SMIcbD6uvUuNQ8s3ftKCHzZ+73JSedvyLM46G/1AGmLd0B3DRcqAYbTy+c+14loFaD+bYbc9Ep5qJ2m8wE4oA0h5lNWTXPu30xicM/K690tYJw2UR+yg3dSq3QHYANu6xLRy2XBRS8dGfHYTY/bpclGunD2/vQwE/XIbgRy7AP2TbJh9KgJfbgC9IocjRintPxSdP7V2ws55jOU6cMNSK5MTpdDoke7Rgw3VIIpZwvJ3MD3Ka0xKcnEfyHeBLtkPJ3WSfatUpIP+mNJ6x+d3oYCcGtPrULGuwlxIwIDAQAB"
