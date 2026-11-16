@@ -282,3 +282,214 @@ async def test_reduce_barrier_finalizes_job(
     deps["job_repo"].mark_job_completed.assert_called_once()
     deps["k8s_provider"].return_value.delete_job.assert_called_once()
     deps["cache_repo"].release_job_capacity.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_message_shuffle_fetch_failed_from_node(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    mocker: Any
+) -> None:
+    """Verifies node-level shuffle failure resolves affected map tasks via CacheRepository and recovers each."""
+    deps = mock_dependencies
+    mock_message = mocker.MagicMock()
+    mock_message.body = json.dumps({
+        "jobId": valid_job_id,
+        "taskId": "0",
+        "jobToken": "token",
+        "status": "FAILED",
+        "error": "SHUFFLE_FETCH_FAILED_FROM_NODE:10.0.1.45:7337"
+    }).encode()
+    mock_message.reject = AsyncMock()
+
+    cms = mocker.AsyncMock()
+    mock_message.process.return_value = cms
+
+    deps["cache_repo"].get_tasks_by_endpoint = AsyncMock(return_value=["map-chunk-0", "map-chunk-2"])
+    deps["cache_repo"].increment_task_failure = AsyncMock(return_value=1)
+    deps["cache_repo"].add_to_recovery_waitlist = AsyncMock()
+    deps["redis_client_provider"].return_value.set = AsyncMock(return_value=True)
+    recover_mock = mocker.patch.object(TaskEventProcessor, "_recover_lost_map_task", new_callable=AsyncMock)
+
+    await TaskEventProcessor.process_message(mock_message)
+
+    deps["cache_repo"].get_tasks_by_endpoint.assert_called_once_with(
+        valid_job_id, "10.0.1.45:7337", deps["redis_client_provider"].return_value
+    )
+    assert recover_mock.call_count == 2
+    assert recover_mock.call_args_list[0][0] == (valid_job_id, "map-chunk-0")
+    assert recover_mock.call_args_list[1][0] == (valid_job_id, "map-chunk-2")
+    mock_message.reject.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_message_generic_failed_retries_map_and_acks(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    mocker: Any
+) -> None:
+    """Verifies non-user-bug Map failure (<3 strikes) republishes via _recover_lost_map_task and ACKs signal."""
+    deps = mock_dependencies
+    mock_message = mocker.MagicMock()
+    mock_message.body = json.dumps({
+        "jobId": valid_job_id,
+        "taskId": "map-chunk-3",
+        "jobToken": "token",
+        "status": "FAILED",
+        "error": "SocketTimeoutException: MinIO read timed out"
+    }).encode()
+    mock_message.reject = AsyncMock()
+    mock_message.process.return_value = mocker.AsyncMock()
+
+    deps["cache_repo"].increment_task_failure = AsyncMock(return_value=1)
+    recover_mock = mocker.patch.object(TaskEventProcessor, "_recover_lost_map_task", new_callable=AsyncMock)
+
+    await TaskEventProcessor.process_message(mock_message)
+
+    recover_mock.assert_called_once_with(valid_job_id, "map-chunk-3")
+    mock_message.reject.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_message_generic_failed_retries_reduce_and_acks(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    valid_user_id: str,
+    mocker: Any
+) -> None:
+    """Verifies non-user-bug Reduce failure (<3 strikes) republishes target partition and ACKs signal."""
+    deps = mock_dependencies
+    mock_message = mocker.MagicMock()
+    mock_message.body = json.dumps({
+        "jobId": valid_job_id,
+        "taskId": "1",
+        "jobToken": "token",
+        "status": "FAILED",
+        "error": "Transient container eviction"
+    }).encode()
+    mock_message.reject = AsyncMock()
+    mock_message.process.return_value = mocker.AsyncMock()
+
+    deps["cache_repo"].increment_task_failure = AsyncMock(return_value=1)
+    deps["job_repo"].get_job_metadata = AsyncMock(return_value={
+        "user_id": uuid.UUID(valid_user_id),
+        "total_chunks": 4,
+        "reducer_filename": "WordCountReducer.class",
+        "num_reducers": 3,
+        "format": "JSON",
+        "status": "RUNNING",
+    })
+    trigger_mock = mocker.patch.object(TaskEventProcessor, "_trigger_reduce_phase", new_callable=AsyncMock)
+
+    await TaskEventProcessor.process_message(mock_message)
+
+    trigger_mock.assert_called_once_with(
+        job_id=valid_job_id,
+        user_id=valid_user_id,
+        reducer_filename="WordCountReducer.class",
+        reducer_class="WordCountReducer",
+        num_reducers=3,
+        target_partition_id=1,
+        file_format="JSON"
+    )
+    mock_message.reject.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_lost_map_task_passes_combiner_and_format(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    valid_user_id: str,
+    mocker: Any
+) -> None:
+    """Verifies _recover_lost_map_task forwards combiner_obj, combiner_class, and file_format."""
+    deps = mock_dependencies
+    deps["job_repo"].get_job_recovery_context = AsyncMock(return_value={
+        "user_id": uuid.UUID(valid_user_id),
+        "format": "JSON",
+        "input_filename": "events.json",
+        "total_chunks": 4,
+        "num_reducers": 2,
+        "num_mappers": 2,
+        "mapper_filename": "JsonMapper.class",
+        "combiner_filename": "JsonCombiner.class",
+    })
+    deps["storage_service"].get_client.return_value.stat_object.return_value.size = 1024
+    deps["k8s_provider"].return_value.spawn_workers = AsyncMock()
+    republish_mock = mocker.patch(
+        "app.services.task_consumer.TaskPublisher.republish_single_map_task",
+        new_callable=AsyncMock
+    )
+
+    await TaskEventProcessor._recover_lost_map_task(valid_job_id, "map-chunk-2")
+
+    republish_mock.assert_called_once()
+    kwargs = republish_mock.call_args.kwargs
+    assert kwargs["combiner_obj"] == f"{valid_user_id}/JsonCombiner.class"
+    assert kwargs["combiner_class"] == "JsonCombiner"
+    assert kwargs["file_format"] == "JSON"
+
+
+@pytest.mark.asyncio
+async def test_process_orchestration_event_phase1_cleanup_idempotent_and_backoff(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    valid_user_id: str,
+    mocker: Any
+) -> None:
+    """Verifies phase-1 cleanup runs once with phase='map' and capacity starvation delays + republishes."""
+    deps = mock_dependencies
+    mock_message = mocker.MagicMock()
+    mock_message.body = valid_job_id.encode("utf-8")
+    mock_message.reject = AsyncMock()
+    mock_message.process.return_value = mocker.AsyncMock()
+
+    deps["job_repo"].get_job_metadata = AsyncMock(return_value={
+        "user_id": uuid.UUID(valid_user_id),
+        "total_chunks": 4,
+        "reducer_filename": "WordCountReducer.class",
+        "num_reducers": 3,
+        "format": "TEXT",
+        "status": "RUNNING",
+    })
+    deps["k8s_provider"].return_value.delete_job = AsyncMock()
+    deps["cache_repo"].release_job_capacity = AsyncMock()
+    deps["cache_repo"].reserve_cluster_capacity = AsyncMock(return_value=1)  # Starved (< 3)
+    deps["redis_client_provider"].return_value.set = AsyncMock(side_effect=[True, False])
+    deps["mq_channel"].return_value.default_exchange.publish = AsyncMock()
+    sleep_mock = mocker.patch("app.services.task_consumer.asyncio.sleep", new_callable=AsyncMock)
+
+    await TaskEventProcessor.process_orchestration_event(mock_message)
+    await TaskEventProcessor.process_orchestration_event(mock_message)
+
+    deps["k8s_provider"].return_value.delete_job.assert_called_once_with(valid_job_id, phase="map")
+    assert sleep_mock.call_count == 2
+    sleep_mock.assert_called_with(2)
+    assert deps["mq_channel"].return_value.default_exchange.publish.call_count == 2
+    mock_message.reject.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trigger_reduce_phase_serializes_format(
+    mock_dependencies: Dict[str, Any],
+    valid_job_id: str,
+    valid_user_id: str
+) -> None:
+    """Verifies _trigger_reduce_phase includes format in serialized TaskMessage."""
+    deps = mock_dependencies
+    mq_mock = deps["mq_channel"].return_value
+    mq_mock.default_exchange.publish = AsyncMock()
+    deps["k8s_provider"].return_value.spawn_workers = AsyncMock()
+    deps["cache_repo"].get_worker_endpoints = AsyncMock(return_value=["node-a@@10.0.1.45:7337"])
+
+    await TaskEventProcessor._trigger_reduce_phase(
+        job_id=valid_job_id,
+        user_id=valid_user_id,
+        reducer_filename="WordCountReducer.class",
+        reducer_class="WordCountReducer",
+        num_reducers=1,
+        file_format="JSON"
+    )
+
+    sent_msg = json.loads(mq_mock.default_exchange.publish.call_args[0][0].body.decode())
+    assert sent_msg["format"] == "JSON"

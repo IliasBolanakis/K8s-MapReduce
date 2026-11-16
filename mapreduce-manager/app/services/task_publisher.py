@@ -75,7 +75,8 @@ class TaskPublisher:
         num_reducers: int,
         mq_channel: aio_pika.RobustChannel,
         combiner_obj: Optional[str] = None,
-        combiner_class: Optional[str] = None
+        combiner_class: Optional[str] = None,
+        file_format: str = "TEXT"
     ) -> None:
         """
         Calculates data splits and broadcasts Map tasks to the worker cluster.
@@ -143,6 +144,7 @@ class TaskPublisher:
                     job_id=job_id,
                     job_token=secure_job_token,
                     task_type=TaskType.MAP,
+                    format=file_format,
                     bucket_name=data_bucket,
                     object_name=data_obj,
                     byte_offset=start_byte,
@@ -196,7 +198,8 @@ class TaskPublisher:
         num_reducers: int,
         mq_channel: aio_pika.abc.AbstractRobustChannel,
         combiner_obj: Optional[str] = None,
-        combiner_class: Optional[str] = None
+        combiner_class: Optional[str] = None,
+        file_format: str = "TEXT"
     ) -> None:
         """
         Republishes a specific Map task for surgical Lineage Recovery.
@@ -276,6 +279,7 @@ class TaskPublisher:
                 job_id=job_id,
                 job_token=secure_job_token,
                 task_type=TaskType.MAP,
+                format=file_format,
                 bucket_name=data_bucket,
                 object_name=data_obj,
                 byte_offset=start_byte,

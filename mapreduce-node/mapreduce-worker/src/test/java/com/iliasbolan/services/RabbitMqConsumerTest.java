@@ -134,14 +134,14 @@ class RabbitMqConsumerTest {
 
     /**
      * Validates error handling logic when a task fails during execution.
-     * Ensures that the message is republished to the back of the queue with an
-     * incremented custom header, and the original message is successfully ACKed.
+     * Ensures that a FAILED signal is emitted to the Manager and the message is
+     * NACKed (requeue=false) without any Node-side basicPublish retry loop.
      *
      * @throws Throwable If the mock execution fails to throw as expected.
      */
     @Test
     @SuppressWarnings("unchecked")
-    void testHandleDelivery_TaskExecutionFailure_RepublishesWithHeader() throws Throwable {
+    void testHandleDelivery_TaskExecutionFailure_SignalsFailureAndNacksWithoutRepublish() throws Throwable {
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
         // Simulate a transient computational failure
         doThrow(new RuntimeException("I/O Error")).when(mockTaskExecutor).executeTask(anyString());
@@ -173,17 +173,42 @@ class RabbitMqConsumerTest {
                 eq("RuntimeException")
         );
 
-        // --- FIX: Verify Republish-with-Header pattern instead of native NACK ---
-        ArgumentCaptor<AMQP.BasicProperties> propsCaptor = ArgumentCaptor.forClass(AMQP.BasicProperties.class);
-        verify(mockChannel).basicPublish(eq(""), eq("test-queue"), propsCaptor.capture(), eq(body));
+        // Verify Manager owns retries: Node NACKs (requeue=false) and never republishes or ACKs
+        verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
+        verify(mockChannel, never()).basicPublish(anyString(), anyString(), any(), any());
+        verify(mockChannel, never()).basicAck(anyLong(), anyBoolean());
 
-        // Assert the custom retry count header was injected/incremented to 2
-        Object retryCount = propsCaptor.getValue().getHeaders().get("x-custom-retry-count");
-        assertEquals(2L, retryCount, "The custom retry header should be incremented to 2.");
+        consumer.stopConsuming();
+        consumerThread.join();
+    }
 
-        // Verify the original failing message was ACKed to clear it from the front of the queue
-        verify(mockChannel).basicAck(eq(deliveryTag), eq(false));
-        // ------------------------------------------------------------------------
+    @Test
+    @SuppressWarnings("unchecked")
+    void testHandleDelivery_TaskFailureWithSignalError_StillNacksWithoutRepublish() throws Throwable {
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
+        doThrow(new RuntimeException("Task Error")).when(mockTaskExecutor).executeTask(anyString());
+        doThrow(new RuntimeException("Event Queue Down")).when(mockEventProducer)
+                .sendErrorSignal(anyString(), anyString(), anyString(), anyString(), anyString());
+
+        Thread consumerThread = new Thread(() -> {
+            try { consumer.startConsuming(); } catch (Exception ignored) {}
+        });
+        consumerThread.start();
+        Thread.sleep(200);
+
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
+        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
+
+        long deliveryTag = 7777L;
+        Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
+        byte[] body = "{\"jobId\":\"job-003\", \"taskId\":\"map-3\", \"jobToken\":\"token-999\"}"
+                .getBytes(StandardCharsets.UTF_8);
+
+        callbackCaptor.getValue().handle("tag", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
+
+        verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
+        verify(mockChannel, never()).basicPublish(anyString(), anyString(), any(), any());
+        verify(mockChannel, never()).basicAck(anyLong(), anyBoolean());
 
         consumer.stopConsuming();
         consumerThread.join();

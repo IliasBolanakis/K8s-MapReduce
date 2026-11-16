@@ -2,6 +2,7 @@ package com.iliasbolan.ess.grpc;
 
 import com.google.protobuf.ByteString;
 import com.iliasbolan.ess.ShuffleDaemon;
+import com.iliasbolan.ess.gc.StorageJanitor;
 import com.iliasbolan.ess.storage.MinioStorageService;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.iliasbolan.grpc.shuffle.PartitionRequest;
@@ -24,6 +25,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -69,8 +71,16 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     /** Concurrency gate to prevent exhausting MinIO connection pools during massive cache misses. */
     private final Semaphore ioPermits;
 
+    /** Per-(jobId, partitionId) single-flight lock registry preventing concurrent restore races. */
+    private final ConcurrentHashMap<String, PartitionLockEntry> restoreLocks = new ConcurrentHashMap<>();
+
     /** Cryptographic key specification for stateless token validation. */
     private final SecretKeySpec secretKeySpec;
+
+    private static final class PartitionLockEntry {
+        final ReentrantLock lock = new ReentrantLock();
+        int refCount = 0;
+    }
 
     /**
      * Initializes the gRPC Shuffle Data Plane.
@@ -149,9 +159,10 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private void executeStreamingTask(String jobId, int partitionId, Path partitionDir,
                                       ServerCallStreamObserver<PartitionChunk> observer,
                                       ReentrantLock flowLock, Condition flowCondition) {
+        StorageJanitor.acquireJobLease(jobId);
         try {
             // Attempt to resolve data (either locally or via S3 restore).
-            // Returns false if it handled a data-skew empty partition internally.
+            // Returns false if it handled a data-skew empty partition or emitted a gRPC error internally.
             if (!resolveStorageTier(jobId, partitionId, partitionDir, observer)) {
                 return;
             }
@@ -165,25 +176,31 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         } catch (Exception e) {
             logger.error("Data Plane Error for directory: {}", partitionDir, e);
             sendError(observer, Status.INTERNAL, e.getMessage());
+        } finally {
+            StorageJanitor.releaseJobLease(jobId);
         }
     }
 
     /**
-     * Resolves cache misses by pulling from MinIO. Handles semaphore gating cleanly.
+     * Resolves cache misses by pulling from MinIO under a per-(jobId, partitionId) single-flight lock.
      *
-     * @return true if data is available locally to stream, false if an empty stream was triggered.
-     * @throws InterruptedException if the thread is interrupted while waiting for an I/O permit.
+     * @return true if data is available locally to stream, false if an empty stream or error was emitted.
+     * @throws InterruptedException if the thread is interrupted while waiting for the lock or an I/O permit.
      */
     private boolean resolveStorageTier(String jobId, int partitionId, Path partitionDir, StreamObserver<PartitionChunk> observer) throws InterruptedException {
-        // Fast path: Data is already local
-        if (Files.exists(partitionDir)) {
-            return true;
-        }
+        String lockKey = jobId + ":" + partitionId;
+        PartitionLockEntry lockEntry = restoreLocks.compute(lockKey, (k, existing) -> {
+            PartitionLockEntry entry = (existing != null) ? existing : new PartitionLockEntry();
+            entry.refCount++;
+            return entry;
+        });
 
-        // Slow path: Cache miss. Acquire permit and attempt MinIO restore.
-        ioPermits.acquire();
+        boolean lockAcquired = false;
         try {
-            // Double-check locking: Ensure another thread didn't just restore it
+            lockEntry.lock.lockInterruptibly();
+            lockAcquired = true;
+
+            // Fast path (serialized per (jobId, partitionId)): Data is already local
             if (Files.exists(partitionDir)) {
                 return true;
             }
@@ -193,16 +210,40 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
                 return false;
             }
 
-            logger.warn("Cache Miss for Partition {}. Restoring from S3...", partitionDir);
-            minioStorageService.restorePartition(jobId, partitionId, partitionDir);
-            return true;
+            // Slow path: Cache miss. Acquire permit and attempt MinIO restore.
+            ioPermits.acquire();
+            try {
+                // Double-check after acquiring permit
+                if (Files.exists(partitionDir)) {
+                    return true;
+                }
 
-        } catch (Exception e) {
-            // Skew Resolution: Restore failed, likely because the partition legitimately has no data
-            handleEmptyPartition(observer, partitionDir);
-            return false;
+                logger.warn("Cache Miss for Partition {}. Restoring from S3...", partitionDir);
+                boolean restored = minioStorageService.restorePartition(jobId, partitionId, partitionDir);
+                if (!restored) {
+                    handleEmptyPartition(observer, partitionDir);
+                    return false;
+                }
+                return true;
+
+            } catch (IOException | RuntimeException e) {
+                logger.error("S3 restore failed for Job {} Partition {}: {}", jobId, partitionId, e.getMessage(), e);
+                sendError(observer, Status.UNAVAILABLE,
+                        "Failed to restore partition from overflow storage: " + e.getMessage());
+                return false;
+            } finally {
+                ioPermits.release();
+            }
         } finally {
-            ioPermits.release();
+            if (lockAcquired) {
+                lockEntry.lock.unlock();
+            }
+            restoreLocks.computeIfPresent(lockKey, (k, existing) -> {
+                if (existing == lockEntry && --existing.refCount == 0) {
+                    return null;
+                }
+                return existing;
+            });
         }
     }
 

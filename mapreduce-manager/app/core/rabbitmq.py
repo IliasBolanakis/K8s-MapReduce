@@ -56,10 +56,10 @@ async def setup_rabbitmq() -> None:
         # --- DLX TOPOLOGY SETUP ---
         logger.info("Declaring Dead Letter Exchange (DLX) topology...")
 
-        # 1. Declare the DLX (Direct Exchange) where rejected messages are routed
+        # 1. Declare the DLX (Fanout Exchange) so dead-lettered messages from dynamic queues route to DLQ
         dlx_exchange = await channel.declare_exchange(
             "dead_letter_exchange",
-            aio_pika.ExchangeType.DIRECT,
+            aio_pika.ExchangeType.FANOUT,
             durable=True
         )
 
@@ -70,12 +70,13 @@ async def setup_rabbitmq() -> None:
             "x-max-length": 10000        # Safety cap to prevent memory exhaustion
         }
 
-        # 3. Declare the actual Dead Letter Queue (DLQ) to hold failed tasks
+        # 3. Declare the actual Dead Letter Queue (DLQ) and bind it to the DLX
         dlq = await channel.declare_queue(
             "dead_letter_queue",
             durable=True,
             arguments=dlq_args
         )
+        await dlq.bind(dlx_exchange)
 
         logger.info("RabbitMQ connection established and DLX initialized.")
     except Exception as e:

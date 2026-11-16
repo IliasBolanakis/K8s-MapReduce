@@ -79,12 +79,12 @@ spec:
         # Provides infinite retention by autonomously spilling data to MinIO
         # when the physical disk breaches the High-Watermark (85%).
         - name: MINIO_ENDPOINT
-          value: "http://minio.default.svc.cluster.local:9000" # Internal Kubernetes DNS for the MinIO service
+          value: "http://minio-service.default.svc.cluster.local:9000" # Internal Kubernetes DNS for the MinIO service
         - name: MINIO_ACCESS_KEY
           value: "minioadmin" # Replace with K8s Secret injection for production
         - name: MINIO_SECRET_KEY
           value: "minioadmin" # Replace with K8s Secret injection for production
-        - name: MINIO_SHUFFLE_BUCKET
+        - name: MINIO_BUCKET
           value: "mapreduce-shuffle-overflow"
 
         volumeMounts:

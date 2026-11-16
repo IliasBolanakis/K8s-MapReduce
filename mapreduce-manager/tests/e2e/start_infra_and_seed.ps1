@@ -1,84 +1,85 @@
 <#
 .SYNOPSIS
-    Infrastructure Startup & MinIO Seeding Script
+    Infrastructure Startup & MinIO Seeding Script (Minikube K8s)
 .DESCRIPTION
-    Lifts Docker-compose backing services and provisions MinIO with
-    the necessary buckets and files for the MapReduce framework.
+    Deploys the Kubernetes backing infrastructure (PostgreSQL, Redis, MinIO, RabbitMQ),
+    compiles the Java E2E fixtures against mapreduce-core, and seeds MinIO buckets
+    ('data', 'code', 'results', 'mapreduce-shuffle-overflow') via kubectl port-forward.
 #>
 
-# =============================================================================
-# 1. CONFIGURATION (VERIFY THESE PATHS)
-# =============================================================================
-$USER_ID             = "22222222-2222-2222-2222-222222222222"
-
-# Project Roots
-$NODE_ROOT           = "C:\Users\hlias\IdeaProjects\mapreduce-node"
-$DOCKER_COMPOSE_PATH = Join-Path $NODE_ROOT "Docker-compose.yml"
-$INIT_DB_SQL_PATH    = "C:\Users\hlias\IdeaProjects\mapreduce-manager\init-db.sql"
-
-# Local Data Paths
-$LOCAL_DATA_FILE     = "C:\Users\hlias\Desktop\Classes\Distributed\Code_And_Data\large_data.txt"
-$LOCAL_MAPPER        = "C:\Users\hlias\Desktop\Classes\Distributed\Code_And_Data\WordCountMapper.class"
-$LOCAL_REDUCER       = "C:\Users\hlias\Desktop\Classes\Distributed\Code_And_Data\WordCountReducer.class"
+$ErrorActionPreference = "Stop"
 
 # =============================================================================
-# 2. START INFRASTRUCTURE
+# 1. CONFIGURATION (MONOREPO PATHS)
 # =============================================================================
-Write-Host "`n[INFO] Starting Docker Compose Infrastructure..." -ForegroundColor Cyan
+$USER_ID        = "22222222-2222-2222-2222-222222222222"
+$K8S_NAMESPACE  = "default"
 
-# Explicitly target the compose file in the node directory
-docker-compose -f $DOCKER_COMPOSE_PATH down 2>$null
-docker-compose -f $DOCKER_COMPOSE_PATH up -d
-
-Write-Host "  -> Waiting for services to initialize (15 seconds)..." -ForegroundColor DarkGray
-Start-Sleep -Seconds 15
-
-# =============================================================================
-# 3. INITIALIZE MINIO BUCKETS
-# =============================================================================
-Write-Host "`n[INFO] Configuring MinIO Buckets..." -ForegroundColor Cyan
-
-# Set up an alias 'myminio' inside the container
-docker exec local-minio mc alias set myminio http://localhost:9000 minioadmin minioadmin 2>$null
-
-Write-Host "  -> Creating 'data', 'code', and 'results' buckets..." -ForegroundColor DarkGray
-docker exec local-minio mc mb myminio/data --ignore-existing 2>$null
-docker exec local-minio mc mb myminio/code --ignore-existing 2>$null
-docker exec local-minio mc mb myminio/results --ignore-existing 2>$null
+$E2E_DIR        = $PSScriptRoot
+$MANAGER_ROOT   = (Resolve-Path (Join-Path $E2E_DIR "..\..")).Path
+$MONOREPO_ROOT  = (Resolve-Path (Join-Path $MANAGER_ROOT "..")).Path
+$NODE_ROOT      = Join-Path $MONOREPO_ROOT "mapreduce-node"
+$CORE_CLASSES   = Join-Path $NODE_ROOT "mapreduce-core\target\classes"
+$K8S_INFRA_DIR  = Join-Path $MANAGER_ROOT "app\k8s\infrastructure"
+$FIXTURES_DIR   = Join-Path $E2E_DIR "fixtures"
+$PYTHON_EXE     = Join-Path $MANAGER_ROOT ".venv\Scripts\python.exe"
 
 # =============================================================================
-# 4. SEED MINIO WITH FILES
+# 2. DEPLOY KUBERNETES INFRASTRUCTURE
 # =============================================================================
-Write-Host "`n[INFO] Uploading artifacts to MinIO..." -ForegroundColor Cyan
+Write-Host "`n[INFO] Applying Kubernetes infrastructure manifests..." -ForegroundColor Cyan
+kubectl apply -f (Join-Path $K8S_INFRA_DIR "postgres-configmap.yaml") -n $K8S_NAMESPACE
+kubectl apply -f (Join-Path $K8S_INFRA_DIR "postgres.yaml") -n $K8S_NAMESPACE
+kubectl apply -f (Join-Path $K8S_INFRA_DIR "redis.yaml") -n $K8S_NAMESPACE
+kubectl apply -f (Join-Path $K8S_INFRA_DIR "minio.yaml") -n $K8S_NAMESPACE
+kubectl set image deployment/minio -n $K8S_NAMESPACE minio=cgr.dev/chainguard/minio:latest
+kubectl apply -f (Join-Path $K8S_INFRA_DIR "rabbitmq.yaml") -n $K8S_NAMESPACE
 
-if (Test-Path $LOCAL_DATA_FILE) {
-    Write-Host "  -> Uploading dataset ($LOCAL_DATA_FILE)..." -ForegroundColor DarkGray
-    docker cp $LOCAL_DATA_FILE "local-minio:/tmp/large_data.txt"
-    docker exec local-minio mc cp /tmp/large_data.txt myminio/data/$USER_ID/large_data.txt
-} else {
-    Write-Host "  [WARNING] Local data file not found at $LOCAL_DATA_FILE" -ForegroundColor Yellow
-}
-
-if ((Test-Path $LOCAL_MAPPER) -and (Test-Path $LOCAL_REDUCER)) {
-    Write-Host "  -> Uploading Java classes..." -ForegroundColor DarkGray
-    docker cp $LOCAL_MAPPER "local-minio:/tmp/WordCountMapper.class"
-    docker cp $LOCAL_REDUCER "local-minio:/tmp/WordCountReducer.class"
-
-    docker exec local-minio mc cp /tmp/WordCountMapper.class myminio/code/$USER_ID/WordCountMapper.class
-    docker exec local-minio mc cp /tmp/WordCountReducer.class myminio/code/$USER_ID/WordCountReducer.class
-} else {
-    Write-Host "  [WARNING] Java class files not found. Check your paths." -ForegroundColor Yellow
+Write-Host "  -> Waiting for infrastructure pods to become Ready..." -ForegroundColor DarkGray
+foreach ($app in "postgres", "redis", "minio", "rabbitmq") {
+    kubectl wait --for=condition=ready pod -l app=$app -n $K8S_NAMESPACE --timeout=180s
 }
 
 # =============================================================================
-# 5. INITIALIZE POSTGRES
+# 3. COMPILE JAVA USER CODE FIXTURES
 # =============================================================================
-Write-Host "`n[INFO] Ensuring Postgres Database Schema is loaded..." -ForegroundColor Cyan
-if (Test-Path $INIT_DB_SQL_PATH) {
-    Get-Content $INIT_DB_SQL_PATH | docker exec -i local-postgres psql -U postgres -d dds_db | Out-Null
-    Write-Host "  -> Database schema initialized." -ForegroundColor Green
-} else {
-    Write-Host "  [WARNING] Schema file not found at $INIT_DB_SQL_PATH" -ForegroundColor Yellow
+Write-Host "`n[INFO] Compiling E2E Java Mapper/Combiner/Reducer fixtures..." -ForegroundColor Cyan
+if (-not (Test-Path $CORE_CLASSES)) {
+    mvn -f (Join-Path $NODE_ROOT "pom.xml") -pl mapreduce-core compile
 }
 
-Write-Host "`n[SUCCESS] Infrastructure is lifted and MinIO is seeded!" -ForegroundColor Green
+$buildDir = Join-Path $env:TEMP "mr-e2e-classes"
+New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+javac --release 17 -cp $CORE_CLASSES -d $buildDir (Join-Path $FIXTURES_DIR "*.java")
+
+# =============================================================================
+# 4. SEED MINIO BUCKETS VIA PORT-FORWARD
+# =============================================================================
+Write-Host "`n[INFO] Seeding MinIO buckets ('data', 'code', 'results', 'mapreduce-shuffle-overflow')..." -ForegroundColor Cyan
+$pf = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -WindowStyle Hidden
+try {
+    Start-Sleep -Seconds 3
+    & $PYTHON_EXE -c @"
+import os
+from minio import Minio
+
+client = Minio('127.0.0.1:19000', access_key='minioadmin', secret_key='minioadmin', secure=False)
+for bucket in ['data', 'code', 'results', 'mapreduce-shuffle-overflow']:
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)
+
+build_dir = r'$buildDir'
+user_id = '$USER_ID'
+for name in os.listdir(build_dir):
+    if name.endswith('.class'):
+        client.fput_object('code', f'{user_id}/{name}', os.path.join(build_dir, name))
+        print(f'Uploaded code/{user_id}/{name}')
+"@
+} finally {
+    if ($pf -and -not $pf.HasExited) {
+        Stop-Process -Id $pf.Id -Force
+    }
+    Remove-Item -Recurse -Force $buildDir -ErrorAction SilentlyContinue
+}
+
+Write-Host "`n[SUCCESS] Kubernetes infrastructure is Ready and MinIO is seeded!" -ForegroundColor Green

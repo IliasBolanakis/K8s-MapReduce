@@ -179,7 +179,7 @@ class JobRepository:
         :rtype: Optional[Dict[str, Any]]
         """
         query = """
-            SELECT user_id, total_chunks, reducer_filename, num_reducers
+            SELECT user_id, total_chunks, reducer_filename, num_reducers, format, status
             FROM public.jobs
             WHERE id = $1;
         """
@@ -326,6 +326,7 @@ class JobRepository:
         """
         query = """
                 SELECT user_id,
+                       format,
                        input_filename,
                        total_chunks,
                        num_reducers,

@@ -1,13 +1,13 @@
 # Distributed MapReduce Execution Fabric (Worker Node)
 
-This repository contains the high-performance parallel execution engine and core API for a distributed MapReduce framework orchestrated on Kubernetes. Designed for cloud-native elasticity, this stateless compute worker dynamically processes Map and Reduce tasks using advanced memory-safe sorting algorithms, resilient AMQP messaging, and Zero-Trust peer-to-peer data transfers.
+This module (`mapreduce-node/`) contains the parallel execution engine (`mapreduce-worker`) and public developer API (`mapreduce-core`) for the Kubernetes-orchestrated MapReduce framework.
 
 ---
 
 ## 📂 Project Structure
 
-* **`mapreduce-core`**: The public developer library containing the strictly typed `Mapper`, `Reducer`, `Combiner`, and `Context` contracts.
-* **`mapreduce-worker`**: The ephemeral compute daemon that manages AMQP consumption, JVM sandboxing, dynamic bytecode localization, and distributed shuffles.
+* **`mapreduce-core`**: Public developer library exposing `Mapper`, `Reducer`, `Combiner`, `Context`, `KeyValuePair`, and `TaskPayload` (including `format`).
+* **`mapreduce-worker`**: Stateless worker daemon handling RabbitMQ task consumption, ephemeral child-JVM sandboxing, atomic bytecode/shuffle staging, External Merge Sort, and gRPC shuffle fetches.
 
 ---
 
@@ -15,32 +15,33 @@ This repository contains the high-performance parallel execution engine and core
 
 ### 1. Dynamic Parallelism (Container-Aware)
 
-The execution engine abandons hardcoded thread counts. It utilizes Java's `ForkJoinPool` with dynamic CPU discovery, automatically detecting Kubernetes vCPU quotas and applying a configurable over-provisioning factor (`PARALLELISM_FACTOR`, default `2.0x`) to mask I/O latency. Work-stealing thresholds are calculated dynamically per-chunk to guarantee thread saturation.
+`MapTaskProcessor` uses Java's `ForkJoinPool` with container-aware `Runtime.availableProcessors()` discovery and a configurable `PARALLELISM_FACTOR` (default `2.0x`), dynamically sizing work-stealing thresholds per chunk.
 
-### 2. Ephemeral JVM Sandboxing (Zero Memory Leaks)
+### 2. Ephemeral JVM Sandboxing & Cgroup Memory Budgeting
 
-To protect the primary Worker Daemon from heap exhaustion (OOM), Metaspace leaks, or malicious user code, all task payloads are executed within an isolated Child JVM process (`SandboxRunner`). Bytecode is dynamically fetched from the multi-tenant MinIO cluster and loaded via Reflection. When the computation completes, the OS physically obliterates the Child JVM, guaranteeing absolute memory reclamation.
+Task payloads run inside an isolated Child JVM (`SandboxRunner`) spawned with `-XX:+UseContainerSupport -XX:MaxRAMPercentage=50.0 -XX:MaxMetaspaceSize=64m`. To prevent `2Gi` container cgroup oversubscription (`OOMKilled` exit 137), the parent daemon `Dockerfile` defaults to `-XX:InitialRAMPercentage=10.0 -XX:MaxRAMPercentage=15.0` (and `worker-template.yaml` caps parent `JAVA_OPTS` at `-Xms128m -Xmx256m`).
+
+`S3ClientService.downloadUserCode` downloads user `.class` files to a sibling `.tmp` file and promotes via `ATOMIC_MOVE` to prevent cross-pod partial reads on shared `SHUFFLE_DIR`.
 
 ### 3. Mid-Stream Local Reduction (Combiner)
 
-Implements an aggressive memory-compression pipeline during the Map phase. If a user supplies a `Combiner`, the Worker intercepts the streaming Map output in transient RAM buffers (micro-batches) and mathematically folds the data before it touches the disk. This drastically reduces network bandwidth during the Shuffle phase and protects downstream Reducers from Zipfian Data Skews.
+When a `Combiner` class is configured on the job, Map tasks fold intermediate key/value micro-batches in memory prior to LZ4 compression and disk flush.
 
 ### 4. O(1) Memory External Merge Sort
 
-Reducers are designed to process massive, multi-gigabyte partitions that far exceed container memory limits. The Worker utilizes a highly optimized K-Way External Merge Sort algorithm. Incoming P2P data streams are chunked, sorted on disk, and lazily evaluated using Java `Iterator` patterns, ensuring a perfectly flat heap memory footprint regardless of dataset scale.
+`ExternalMergeSorter` spills sorted, LZ4-compressed intermediate runs (`run_*.lz4`) and performs K-way merge-sort via lazy `Iterator` streaming (`StreamGroupingIterator`) so user `Reducer` logic processes large partitions with bounded heap.
 
-### 5. Secure P2P gRPC Shuffle
+### 5. Secure Atomic P2P gRPC Shuffle & Manager-Owned Retries
 
-Eliminates centralized storage bottlenecks during the Shuffle phase. Reducers establish direct, decentralized peer-to-peer gRPC streams with Map nodes to fetch their partitions.
-
-* **Integrity:** Streams are written atomically to `.lz4` files to prevent corrupted frames in volatile cluster environments.
-* **Zero-Trust:** All P2P requests require a cryptographic authorization token injected by the Orchestrator.
+* **Atomic Partition Writes:** `ShufflePartitioner` writes intermediate shuffle streams to `<mapTaskId>.tmp` inside `<SHUFFLE_DIR>/<jobId>/<partitionId>/`, flushes and closes streams on `close()`, and atomically promotes via `Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)` to `<mapTaskId>.lz4` (deleting `.tmp` files on error).
+* **Bounded gRPC Fetches:** Reducers authenticate to ESS nodes (`authorization: <jobToken>`) and apply an explicit RPC deadline (`.withDeadlineAfter(...)`, configured via `GRPC_FETCH_DEADLINE_SECONDS`, default `300s`).
+* **Manager-Owned Retries:** On gRPC fetch failures, `TaskExecutor` emits `SHUFFLE_FETCH_FAILED_FROM_NODE:<endpoint>` (`FAILED`) to `job_events_queue`. On task exceptions, `RabbitMqConsumer` emits `FAILED` and calls `basicNack(deliveryTag, false, false)` (without local AMQP republishing), letting `mapreduce-manager` own task retries and lineage recovery.
 
 ---
 
 ## 👨‍💻 Developer Guide: Writing a MapReduce Job
 
-Users can write custom Distributed applications by importing the `mapreduce-core` library and implementing the required interfaces.
+Users write jobs against `mapreduce-core` and compile `.class` files targeting Java 17.
 
 ### 1. Dependency (`pom.xml`)
 
@@ -51,16 +52,15 @@ Users can write custom Distributed applications by importing the `mapreduce-core
 </repository>
 
 <dependency>
-    <groupId>com.github.georgekarabaggelisjr.distributedsystemsproject</groupId>
+    <groupId>com.github.IliasBolanakis.K8s-MapReduce</groupId>
     <artifactId>mapreduce-core</artifactId>
-    <version>v3.0</version>
+    <version>main-SNAPSHOT</version>
 </dependency>
-
 ```
 
-### 2. Implementing the Topology (Word Count Example)
+### 2. Implementing the Topology (WordCount Example)
 
-**The Mapper:** Uses the Streaming `Context` pattern to emit data dynamically without retaining master lists in memory.
+**Mapper:**
 
 ```java
 import com.iliasbolan.core.Mapper;
@@ -71,16 +71,15 @@ public class WordCountMapper implements Mapper {
     public void map(String chunkOfText, Context context) {
         String[] words = chunkOfText.toLowerCase().replaceAll("[^a-z0-9]+", " ").split("\\s+");
         for (String word : words) {
-            if (word.length() > 1) { 
-                context.write(word, "1"); 
+            if (!word.isEmpty()) {
+                context.write(word, "1");
             }
         }
     }
 }
-
 ```
 
-**The Combiner (Optional Optimization):** Executes purely on the Map node to compress network payloads. Implements the strict `Combiner` interface to ensure mathematical commutativity.
+**Combiner (Optional):**
 
 ```java
 import com.iliasbolan.core.Combiner;
@@ -97,10 +96,9 @@ public class WordCountCombiner implements Combiner {
         return new KeyValuePair(key, String.valueOf(localTotal));
     }
 }
-
 ```
 
-**The Reducer:** Executes on the Reduce node, processing the fully aggregated and shuffled data streams.
+**Reducer:**
 
 ```java
 import com.iliasbolan.core.Reducer;
@@ -117,34 +115,57 @@ public class WordCountReducer implements Reducer {
         return new KeyValuePair(key, String.valueOf(globalTotal));
     }
 }
-
 ```
 
 ### 3. Compilation & Submission
 
-Compile your classes (targeting Java 17 compatibility for the Worker Daemon):
+Compile targeting Java 17 (against `mapreduce-core` classes/JAR):
 
 ```bash
-javac --release 17 -cp mapreduce-core-3.0.jar WordCountMapper.java WordCountCombiner.java WordCountReducer.java
-
+javac --release 17 -cp mapreduce-core/target/classes WordCountMapper.java WordCountCombiner.java WordCountReducer.java
 ```
 
-Upload the compiled `.class` files to your MinIO sandbox, and submit the execution payload to the Manager API!
+Upload the compiled `.class` files to MinIO (`code/<user_id>/`) and submit the job payload to `mapreduce-manager`.
 
 ---
 
 ## ⚙️ Worker Configuration (Environment Variables)
 
-The Worker Daemon is configured automatically by the Kubernetes Deployment manifests, but can be overridden via ENV vars:
-
 | Variable | Description | Default |
 | --- | --- | --- |
-| `RABBITMQ_HOST` | AMQP Broker Hostname | `localhost` |
-| `MINIO_ENDPOINT` | S3-Compatible Object Store URL | `http://localhost:9000` |
-| `NODE_IP` | The physical Host IP for gRPC P2P Routing | *(Injected by K8s Downward API)* |
-| `NODE_NAME` | The physical Hostname for Log tracing | *(Injected by K8s Downward API)* |
-| `PARALLELISM_FACTOR` | CPU Scaling factor for Fork/Join Pool | `2.0` |
-| `SHUFFLE_BASE_DIR` | Mount path for ephemeral fast-disk I/O | `/mnt/mapreduce-shuffle` |
+| `RABBITMQ_HOST` | AMQP broker hostname | `localhost` |
+| `RABBITMQ_USER` / `RABBITMQ_PASS` | AMQP credentials | `guest` / `guest` |
+| `RABBITMQ_QUEUE` | Fallback task queue when `JOB_ID` is unset | `map_tasks_queue` |
+| `EVENT_QUEUE` | Manager status/heartbeat event queue | `job_events_queue` |
+| `MINIO_ENDPOINT` | S3-compatible object store URL | `http://localhost:9000` |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO creds read by parent worker (also fallback for `SandboxRunner`) | `minioadmin` / `minioadmin` |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | Optional overrides read first by `SandboxRunner` (falls back to `MINIO_ROOT_*`) | *(falls back to `MINIO_ROOT_*`)* |
+| `SHUFFLE_DIR` | Host path for ephemeral shuffle I/O & usercode staging | `/mnt/mapreduce-shuffle` |
+| `GRPC_FETCH_DEADLINE_SECONDS` | Per-host gRPC `GetPartition` deadline in seconds | `300` |
+| `IDLE_TIMEOUT_MILLIS` | Inactivity shutdown timeout in milliseconds (`10000` in K8s template) | `5000` |
+| `NODE_IP` / `NODE_NAME` | Physical host IP & hostname for ESS routing | *(Injected by K8s Downward API)* / `127.0.0.1` |
+| `PARALLELISM_FACTOR` | CPU scaling multiplier for `ForkJoinPool` | `2.0` |
+
+---
+
+## 🐳 Building & Testing
+
+### Build Container Image
+
+```bash
+# Inside Minikube Docker env (or local Docker)
+docker build -t mapreduce-worker:v10 .
+```
+
+### Run Unit & Integration Tests
+
+```bash
+# Unit tests (31 tests across core, engine, shuffle, and services)
+mvn test "-Dtest=!S3ClientServiceIntegrationTest" "-Dsurefire.failIfNoSpecifiedTests=false"
+
+# Full test suite including S3ClientServiceIntegrationTest (requires MinIO on http://localhost:9000)
+mvn test
+```
 
 ---
 

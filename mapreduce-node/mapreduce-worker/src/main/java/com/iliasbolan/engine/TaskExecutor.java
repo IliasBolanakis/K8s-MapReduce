@@ -87,6 +87,8 @@ public class TaskExecutor {
     private static final Metadata.Key<String> AUTH_KEY =
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
 
+    private static final long DEFAULT_GRPC_FETCH_DEADLINE_SECONDS = 300L;
+
     /**
      * Initializes the orchestration engine with its required dependencies.
      *
@@ -267,7 +269,9 @@ public class TaskExecutor {
                     header.put(AUTH_KEY, payload.jobToken());
 
                     ClientInterceptor authInterceptor = MetadataUtils.newAttachHeadersInterceptor(header);
+                    long grpcDeadlineSeconds = resolveGrpcFetchDeadlineSeconds();
                     ShuffleServiceGrpc.ShuffleServiceBlockingStub stub = ShuffleServiceGrpc.newBlockingStub(channel)
+                            .withDeadlineAfter(grpcDeadlineSeconds, TimeUnit.SECONDS)
                             .withInterceptors(authInterceptor);
 
                     PartitionRequest request = PartitionRequest.newBuilder()
@@ -414,5 +418,22 @@ public class TaskExecutor {
             throw new SecurityException("Invalid class name format. Potential path traversal detected: " + input);
         }
         return input;
+    }
+
+    static long resolveGrpcFetchDeadlineSeconds() {
+        return parseGrpcFetchDeadlineSeconds(System.getenv("GRPC_FETCH_DEADLINE_SECONDS"));
+    }
+
+    static long parseGrpcFetchDeadlineSeconds(String rawValue) {
+        if (rawValue == null || rawValue.trim().isEmpty()) {
+            return DEFAULT_GRPC_FETCH_DEADLINE_SECONDS;
+        }
+        try {
+            long parsed = Long.parseLong(rawValue.trim());
+            return parsed > 0 ? parsed : DEFAULT_GRPC_FETCH_DEADLINE_SECONDS;
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid GRPC_FETCH_DEADLINE_SECONDS '{}', defaulting to {}s", rawValue, DEFAULT_GRPC_FETCH_DEADLINE_SECONDS);
+            return DEFAULT_GRPC_FETCH_DEADLINE_SECONDS;
+        }
     }
 }

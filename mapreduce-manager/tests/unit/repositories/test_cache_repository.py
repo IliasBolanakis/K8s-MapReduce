@@ -166,3 +166,21 @@ async def test_get_cached_total_chunks_missing(mock_redis):
     result = await CacheRepository.get_cached_total_chunks(job_id, mock_redis)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_by_endpoint(mock_redis):
+    """
+    Verifies node-level endpoint reverse lookup matches exact or 'node@@endpoint' entries.
+    """
+    job_id = "test-job-123"
+    mock_redis.hgetall.return_value = {
+        b"map-chunk-0": b"worker-node-1@@10.0.1.45:7337",
+        b"map-chunk-1": b"worker-node-2@@10.0.1.46:7337",
+        b"map-chunk-2": b"10.0.1.45:7337",
+    }
+
+    result = await CacheRepository.get_tasks_by_endpoint(job_id, "10.0.1.45:7337", mock_redis)
+
+    assert result == ["map-chunk-0", "map-chunk-2"]
+    mock_redis.hgetall.assert_called_once_with(f"job:{job_id}:worker_endpoints")

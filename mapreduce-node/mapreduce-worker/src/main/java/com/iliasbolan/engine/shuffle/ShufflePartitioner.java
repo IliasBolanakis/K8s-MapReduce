@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -44,6 +45,7 @@ public class ShufflePartitioner implements AutoCloseable {
 
     /** Persistent cache of open writers to prevent LZ4 frame thrashing. */
     private final ConcurrentHashMap<Integer, BufferedWriter> writerCache = new ConcurrentHashMap<>();
+    private volatile boolean writeFailed = false;
 
     /**
      * Initializes the ShufflePartitioner and establishes the physical directory boundaries.
@@ -111,14 +113,19 @@ public class ShufflePartitioner implements AutoCloseable {
             if (partitionRecords != null && !partitionRecords.isEmpty()) {
                 // ONE lock acquisition for the entire sub-batch destined for this file
                 synchronized (partitionLocks[i]) {
-                    BufferedWriter writer = getOrCreateWriter(i);
+                    try {
+                        BufferedWriter writer = getOrCreateWriter(i);
 
-                    // Sequential write to the OS buffer
-                    for (KeyValuePair pair : partitionRecords) {
-                        writer.write(pair.key());
-                        writer.write('\t');
-                        writer.write(pair.value());
-                        writer.write('\n');
+                        // Sequential write to the OS buffer
+                        for (KeyValuePair pair : partitionRecords) {
+                            writer.write(pair.key());
+                            writer.write('\t');
+                            writer.write(pair.value());
+                            writer.write('\n');
+                        }
+                    } catch (Throwable t) {
+                        writeFailed = true;
+                        throw t;
                     }
                 }
             }
@@ -142,17 +149,25 @@ public class ShufflePartitioner implements AutoCloseable {
         // but retaining this call ensures idempotency if manual disk interventions occurred.
         Files.createDirectories(partitionDir);
 
-        // Use TRUNCATE_EXISTING instead of APPEND. If a Map task is retried (Lineage Recovery),
-        // the system must start a fresh LZ4 frame to prevent binary corruption on the Reducer.
-        Path filePath = partitionDir.resolve(mapTaskId + ".lz4");
-        OutputStream os = Files.newOutputStream(filePath,
+        // Write to a temporary .tmp file first and atomically move to .lz4 on close()
+        // so failed attempts never expose partial LZ4 frames to the ESS or Reducers.
+        Path tmpPath = partitionDir.resolve(mapTaskId + ".tmp");
+        OutputStream os = Files.newOutputStream(tmpPath,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-        LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os, BLOCKSIZE.SIZE_4MB);
-        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8));
-
-        writerCache.put(partitionIndex, writer);
-        return writer;
+        try {
+            LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os, BLOCKSIZE.SIZE_4MB);
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8));
+            writerCache.put(partitionIndex, writer);
+            return writer;
+        } catch (Throwable t) {
+            try {
+                os.close();
+            } catch (IOException ignored) {
+            }
+            Files.deleteIfExists(tmpPath);
+            throw t;
+        }
     }
 
     /**
@@ -165,12 +180,37 @@ public class ShufflePartitioner implements AutoCloseable {
     @Override
     public void close() {
         logger.info("Finalizing LZ4 partition frames for task: {}", mapTaskId);
-        for (BufferedWriter writer : writerCache.values()) {
+        for (Map.Entry<Integer, BufferedWriter> entry : writerCache.entrySet()) {
+            int partitionIndex = entry.getKey();
+            BufferedWriter writer = entry.getValue();
+            Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
+            Path tmpPath = partitionDir.resolve(mapTaskId + ".tmp");
+            Path finalPath = partitionDir.resolve(mapTaskId + ".lz4");
+            boolean finalized = false;
+
             try {
-                writer.flush();
-                writer.close();
+                if (!writeFailed) {
+                    writer.flush();
+                    writer.close();
+                    Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    finalized = true;
+                } else {
+                    writer.close();
+                }
             } catch (IOException e) {
-                logger.error("Failed to finalize shuffle stream for task: {}", mapTaskId, e);
+                logger.error("Failed to finalize shuffle stream for task {} partition {}", mapTaskId, partitionIndex, e);
+                try {
+                    writer.close();
+                } catch (IOException ignored) {
+                }
+            } finally {
+                if (!finalized) {
+                    try {
+                        Files.deleteIfExists(tmpPath);
+                    } catch (IOException deleteEx) {
+                        logger.warn("Failed to delete temporary shuffle file {}", tmpPath, deleteEx);
+                    }
+                }
             }
         }
         writerCache.clear();

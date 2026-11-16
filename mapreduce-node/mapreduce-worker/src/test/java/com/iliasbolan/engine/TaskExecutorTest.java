@@ -1,8 +1,11 @@
 package com.iliasbolan.engine;
 
+import com.iliasbolan.grpc.shuffle.PartitionChunk;
+import com.iliasbolan.grpc.shuffle.PartitionRequest;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
 import com.iliasbolan.services.RabbitMqProducer;
 import com.iliasbolan.services.S3ClientService;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -15,6 +18,8 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -231,5 +236,63 @@ class TaskExecutorTest {
                 """;
 
         assertThrows(IllegalArgumentException.class, () -> taskExecutor.executeTask(jsonPayload));
+    }
+
+    @Test
+    void testExecuteReducePhase_AppliesGrpcDeadlineToBlockingStub() throws Throwable {
+        String jsonPayload = """
+                {
+                    "jobId": "job-deadline",
+                    "taskId": "0",
+                    "jobToken": "deadline-token",
+                    "taskType": "REDUCE",
+                    "className": "com.test.Reducer",
+                    "userCodeBucket": "code",
+                    "userCodeObject": "reducer.class",
+                    "workerEndpoints": ["10.244.2.15:7337"]
+                }
+                """;
+
+        ManagedChannel mockChannel = mock(ManagedChannel.class);
+        ManagedChannelBuilder mockBuilder = mock(ManagedChannelBuilder.class);
+        ShuffleServiceGrpc.ShuffleServiceBlockingStub mockStub = mock(ShuffleServiceGrpc.ShuffleServiceBlockingStub.class);
+        Process mockProcess = mock(Process.class);
+        when(mockProcess.waitFor()).thenReturn(0);
+
+        try (MockedStatic<ManagedChannelBuilder> staticBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
+             MockedStatic<ShuffleServiceGrpc> staticGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class);
+             MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
+                     (mock, context) -> {
+                         when(mock.start()).thenReturn(mockProcess);
+                         when(mock.inheritIO()).thenReturn(mock);
+                     })) {
+
+            staticBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockBuilder);
+            when(mockBuilder.usePlaintext()).thenReturn(mockBuilder);
+            when(mockBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockBuilder);
+            when(mockBuilder.build()).thenReturn(mockChannel);
+            when(mockChannel.shutdown()).thenReturn(mockChannel);
+
+            staticGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(mockChannel)).thenReturn(mockStub);
+            when(mockStub.withDeadlineAfter(anyLong(), eq(TimeUnit.SECONDS))).thenReturn(mockStub);
+            when(mockStub.withInterceptors(any(ClientInterceptor.class))).thenReturn(mockStub);
+            when(mockStub.getPartition(any(PartitionRequest.class))).thenReturn(Collections.<PartitionChunk>emptyIterator());
+
+            taskExecutor.executeTask(jsonPayload);
+
+            verify(mockStub).withDeadlineAfter(eq(TaskExecutor.resolveGrpcFetchDeadlineSeconds()), eq(TimeUnit.SECONDS));
+            verify(mockStub).withInterceptors(any(ClientInterceptor.class));
+            verify(eventProducer).sendCompletionSignal("job-deadline", "0", "deadline-token", "COMPLETED", null);
+        }
+    }
+
+    @Test
+    void testParseGrpcFetchDeadlineSeconds_HandlesDefaultsAndCustomValues() {
+        assertEquals(300L, TaskExecutor.parseGrpcFetchDeadlineSeconds(null));
+        assertEquals(300L, TaskExecutor.parseGrpcFetchDeadlineSeconds(""));
+        assertEquals(300L, TaskExecutor.parseGrpcFetchDeadlineSeconds("0"));
+        assertEquals(300L, TaskExecutor.parseGrpcFetchDeadlineSeconds("-10"));
+        assertEquals(300L, TaskExecutor.parseGrpcFetchDeadlineSeconds("not-a-number"));
+        assertEquals(120L, TaskExecutor.parseGrpcFetchDeadlineSeconds("120"));
     }
 }

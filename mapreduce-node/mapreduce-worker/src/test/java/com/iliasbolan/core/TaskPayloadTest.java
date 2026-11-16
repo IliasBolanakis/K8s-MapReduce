@@ -7,6 +7,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Unit tests for the {@link TaskPayload} record.
@@ -50,7 +51,9 @@ class TaskPayloadTest {
                     "userCodeBucket": "user-code",
                     "userCodeObject": "WordCountReducer.class",
                     "className": "com.example.WordCountReducer",
-                    "workerEndpoints": ["10.0.1.45:7337", "10.0.1.46:7337"]
+                    "workerEndpoints": ["10.0.1.45:7337", "10.0.1.46:7337"],
+                    "format": "TEXT",
+                    "futureUnknownField": "ignored"
                 }
                 """;
 
@@ -66,10 +69,25 @@ class TaskPayloadTest {
         assertEquals("secure-hmac-token-xyz", payload.jobToken()); // NEW: Token validation
         assertEquals("REDUCE", payload.taskType());
         assertEquals(4, payload.numReducers());
+        assertEquals("TEXT", payload.format());
 
         // Verify Peer-to-Peer Shuffle routing table mapping
         assertNotNull(payload.workerEndpoints(), "workerEndpoints list should be initialized");
         assertEquals(2, payload.workerEndpoints().size());
         assertEquals(List.of("10.0.1.45:7337", "10.0.1.46:7337"), payload.workerEndpoints());
+    }
+
+    @Test
+    void testJsonDeserialization_AllowsOmittedFormat() throws Exception {
+        String jsonPayload = """
+                {
+                    "jobId": "job-2026",
+                    "taskId": "map-0",
+                    "taskType": "MAP"
+                }
+                """;
+
+        TaskPayload payload = new ObjectMapper().readValue(jsonPayload, TaskPayload.class);
+        assertNull(payload.format());
     }
 }

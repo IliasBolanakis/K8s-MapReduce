@@ -17,6 +17,7 @@ data:
         input_filename VARCHAR(255) NOT NULL,
         mapper_filename VARCHAR(255) NOT NULL,
         reducer_filename VARCHAR(255) NOT NULL,
+        combiner_filename VARCHAR(255),
 
         -- Dynamic Scaling & Progress Counters
         num_reducers INTEGER NOT NULL DEFAULT 3,

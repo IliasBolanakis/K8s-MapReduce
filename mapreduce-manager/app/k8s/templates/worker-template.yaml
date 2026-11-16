@@ -6,6 +6,7 @@ metadata:
   labels:
     app: worker-node
     job_id: "{{ JOB_ID }}"
+    phase: "{{ PHASE }}"
     tier: compute
 spec:
   parallelism: {{ REPLICAS }}
@@ -16,6 +17,7 @@ spec:
       labels:
         app: worker-node
         job_id: "{{ JOB_ID }}"
+        phase: "{{ PHASE }}"
         tier: compute
     spec:
       # --- DATA LOCALITY SCHEDULING ---
@@ -64,7 +66,7 @@ spec:
           # 2. MaxDirectMemorySize=256m strictly caps off-heap NIO allocations during shuffle
           #    fetches to prevent the K8s container from hitting OOMKilled over the 2Gi limit.
           - name: JAVA_OPTS
-            value: "-Xms512m -Xmx1536m -XX:+UseParallelGC -XX:MaxDirectMemorySize=256m"
+            value: "-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m"
 
           - name: RABBITMQ_HOST
             value: "{{ RABBITMQ_HOST }}"

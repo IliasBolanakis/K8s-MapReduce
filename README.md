@@ -1,108 +1,150 @@
 # Kubernetes MapReduce Framework (K8s-MapReduce)
 
-A cloud-native, high-throughput distributed MapReduce framework built for Kubernetes. 
+A cloud-native, high-throughput distributed MapReduce framework built for Kubernetes.
 
-This monorepo contains the complete infrastructure, control plane, and execution fabric required to schedule, isolate, and execute massive parallel data processing tasks across volatile compute clusters. It implements advanced distributed systems concepts including Active-Active state reconciliation, Ephemeral JVM Sandboxing, O(1) Memory External Merge Sorting, and Decentralized peer-to-peer (P2P) Shuffling.
+This monorepo contains the complete infrastructure, control plane, execution engine, and shuffle data plane required to schedule, isolate, and execute parallel data processing workloads across Kubernetes clusters. It implements Active-Active state reconciliation, Ephemeral JVM Sandboxing, External Merge Sorting, and Decentralized peer-to-peer (P2P) gRPC Shuffling with MinIO overflow tiering.
 
 ---
 
 ## 🏗️ System Architecture & Monorepo Structure
 
-The framework is strictly decoupled into three primary subsystems. Each directory contains its own detailed `README.md` for specific architectural and setup instructions.
+The framework is decoupled into three primary subsystems. Each directory contains its own detailed `README.md`:
 
 ### 1. [`/mapreduce-manager`](./mapreduce-manager/) (The Control Plane)
-The central Orchestrator built in **Python (FastAPI)**. It operates in an Active-Active high-availability mode, backed by PostgreSQL, Redis, and RabbitMQ.
-* **O(1) Data Partitioning:** Streams byte-range boundary generation to message queues without loading multi-terabyte datasets into Manager memory.
-* **Autonomous Daemons:** Features a Redis-backed Distributed Leader Election system running a *Watchdog* (for garbage collection of stalled K8s jobs) and a *Reconciler* (for healing state drift between Redis and the K8s API).
-* **Fail-Fast Protocol:** Surgically intercepts terminal deterministic exceptions (e.g., `UnsupportedClassVersionError`) and immediately reclaims cluster resources to prevent infinite retry deadlocks.
+
+The central Orchestrator built in **Python (FastAPI)**. It operates in Active-Active mode backed by PostgreSQL, Redis, and RabbitMQ.
+
+* **O(1) Data Partitioning:** Streams byte-range split generation to RabbitMQ lazy queues without buffering datasets in Manager memory.
+* **Stateful Barriers & Lineage Recovery:** Uses atomic Redis Lua barriers and `job:<id>:worker_endpoints` tracking to trigger phase transitions and surgically recover failed Map nodes (`SHUFFLE_FETCH_FAILED:<taskId>` and `SHUFFLE_FETCH_FAILED_FROM_NODE:<ip:port>`).
+* **Autonomous Daemons:** Runs Redis-locked *Watchdog* (stalled job reclamation) and *Reconciler* (Redis vs. Kubernetes state drift cleanup) background loops.
+* **Fail-Fast & DLQ Protection:** Intercepts deterministic user-code failures and routes rejected tasks through a bound `FANOUT` Dead Letter Exchange (`dead_letter_exchange` -> `dead_letter_queue`).
 
 ### 2. [`/mapreduce-node`](./mapreduce-node/) (The Execution Fabric)
-The stateless compute worker built in **Java 17**. It fetches tasks from RabbitMQ and executes user bytecode.
-* **Ephemeral JVM Sandboxing:** User code (`Mapper`, `Combiner`, `Reducer`) is dynamically loaded into an isolated Child JVM process. Once the task finishes, the OS obliterates the process, guaranteeing zero heap exhaustion or Metaspace leaks.
-* **Mid-Stream Combiners:** Aggressively compresses data in RAM micro-batches before spilling to disk, mitigating network bottlenecks and downstream data skew.
-* **O(1) External Merge Sort:** Reducers process multi-gigabyte shuffle partitions using K-Way external merge sorting, lazily evaluating data via Java Iterators to maintain a perfectly flat heap footprint.
-* Includes the **`mapreduce-core`** library, which exposes the API contracts developers use to write custom MapReduce topologies.
 
-### 3. [`/mapreduce-ess`](./mapreduce-ess/) (The Network Fabric)
-The **External Shuffle Service** deployed as a Kubernetes `DaemonSet`. 
-* **gRPC Peer-to-Peer:** Bypasses centralized storage bottlenecks by allowing Reducers to establish direct, high-speed gRPC streams to the specific physical nodes holding their required Map partitions.
-* **Zero-Trust Security:** Secures all cross-node data transfers using cryptographic authorization tokens injected by the Orchestrator.
+The stateless compute worker built in **Java 17**. It consumes phase tasks (`basicQos(1)`) from RabbitMQ and spawns an isolated child JVM per task.
+
+* **Ephemeral JVM Sandboxing:** User code (`Mapper`, `Combiner`, `Reducer`) executes inside an ephemeral `SandboxRunner` child JVM (`-XX:MaxRAMPercentage=50.0`), while the parent worker daemon stays capped (`-Xmx256m` in Kubernetes / `-XX:MaxRAMPercentage=15.0` in Docker) so both fit safely inside the `2Gi` container cgroup limit.
+* **Mid-Stream Combiners & Atomic Shuffle Writes:** Optional `Combiner` classes fold records in RAM before writing intermediate `.tmp` files and atomically promoting (`ATOMIC_MOVE`) to `.lz4` on completion.
+* **External Merge Sort & Bounded gRPC Shuffle:** Reducers fetch upstream `.lz4` partitions over gRPC with explicit RPC deadlines (`GRPC_FETCH_DEADLINE_SECONDS`, default `300s`) and run K-way merge-sort via lazy iterators.
+* Includes **`mapreduce-core`**, exposing the `Mapper`, `Reducer`, `Combiner`, and `Context` developer APIs.
+
+### 3. [`/mapreduce-ess`](./mapreduce-ess/) (The Shuffle Data Plane)
+
+The **External Shuffle Service** deployed as a Kubernetes `DaemonSet` (`hostNetwork: true`, port `7337`).
+
+* **gRPC Peer-to-Peer Streaming:** Streams pre-compressed `.lz4` segments from host NVMe/SSD (`SHUFFLE_DIR`) using Virtual Threads and 65KB NIO Direct Buffers with HTTP/2 flow control.
+* **Single-Flight MinIO Overflow & Lease-Safe GC:** `StorageJanitor` spills idle job data to MinIO (`MINIO_BUCKET`, `mapreduce-shuffle-overflow` in K8s) above 85% disk usage while skipping active `.tmp` staging and active stream/restore leases; `MinioStorageService` restores missing partitions atomically under a per-`(jobId, partitionId)` single-flight lock and propagates S3 failures as `Status.UNAVAILABLE`.
 
 ---
 
 ## 🌟 Core Flow
 
-1. **Submission:** A client submits a Job payload (specifying S3 file targets and `.class` file names) to any active `mapreduce-manager` replica.
-2. **Provisioning:** The Manager calculates byte boundaries and spins up Ephemeral `mapreduce-worker` Pods via the K8s Batch API.
-3. **Map Phase:** Workers securely download user bytecode, isolate it in a Sandbox JVM, process data in chunks, apply Combiner compression, and spill intermediate data to the host node's ESS volume.
-4. **Barrier Synchronization:** Atomic Redis Lua scripts track completion. Once the Map phase hits 100%, Reducers are triggered.
-5. **Reduce Phase:** Reducers use K8s Node Affinity to schedule near the heaviest partitions, fetch remaining partitions via gRPC P2P streams, perform an External Merge Sort, and write final outputs to a tenant-isolated S3 bucket.
+1. **Submission:** A client submits a Job payload (`format`, S3 filenames, `.class` names, optional `combiner_filename`, `num_mappers`, `num_reducers`) to `mapreduce-manager`.
+2. **Provisioning:** The Manager records the job in PostgreSQL, reserves capacity in Redis, declares job-scoped lazy RabbitMQ queues, and provisions Ephemeral `mapreduce-worker:v10` Map Pods via the Kubernetes Batch API.
+3. **Map Phase:** Workers atomically stage user `.class` bytecode, run the `SandboxRunner` child JVM, apply optional Combiners, and atomically commit `<mapTaskId>.lz4` files to the host ESS volume (`/mnt/mapreduce-shuffle`).
+4. **Barrier Synchronization:** Atomic Redis Lua scripts track Map completion and transition cleanly to Reduce (`delete_job(..., phase="map")` cleans Map pods/queues without deleting `reduce_tasks_<jobId>`).
+5. **Reduce Phase:** Reducers use soft Kubernetes `nodeAffinity` toward ESS nodes, stream partitions via gRPC (`GetPartition`) with deadlines, external merge-sort, and write `result_part_<id>.txt` to `s3://results/<user_id>/<job_id>/`.
 
 ---
 
-## 🚀 Quick Start (Local Development)
+## 🚀 Quick Start (Local Minikube Cluster, >=30 GiB RAM)
 
 ### Prerequisites
-* **Python 3.11+**
-* **Java 17** & **Maven**
-* **Docker** & **Docker Compose**
-* **Kubernetes** (Minikube or equivalent)
 
-### 1. Bootstrapping Infrastructure
-Start the backing infrastructure (PostgreSQL, Redis, RabbitMQ, MinIO) required by the Manager:
-```bash
+* **Python 3.11+** (tested with 3.13)
+* **Java 17+** & **Maven 3.9+**
+* **Docker**, **Minikube**, and **kubectl**
+
+### 1. Start Minikube (>=30 GiB RAM)
+
+```powershell
+minikube start --driver=docker --memory=30720 --cpus=6 --nodes=1
+minikube status
+```
+
+### 2. Build Local Images Inside Minikube
+
+Switch your shell to Minikube's Docker daemon and build all three container images (`mapreduce-ess:v2`, `mapreduce-worker:v10`, `mapreduce-manager:v1`):
+
+```powershell
+& minikube -p minikube docker-env --shell powershell | Invoke-Expression
+
+mvn -f mapreduce-ess/pom.xml clean package -DskipTests
+docker build -t mapreduce-ess:v2 mapreduce-ess
+docker build -t mapreduce-worker:v10 mapreduce-node
+docker build -t mapreduce-manager:v1 mapreduce-manager
+```
+
+### 3. Deploy Infrastructure, Manager & ESS to Kubernetes
+
+```powershell
+# 1. Backing infrastructure (PostgreSQL, Redis, MinIO, RabbitMQ)
+kubectl apply -f mapreduce-manager/app/k8s/infrastructure/postgres-configmap.yaml
+kubectl apply -f mapreduce-manager/app/k8s/infrastructure/postgres.yaml
+kubectl apply -f mapreduce-manager/app/k8s/infrastructure/redis.yaml
+kubectl apply -f mapreduce-manager/app/k8s/infrastructure/minio.yaml
+kubectl apply -f mapreduce-manager/app/k8s/infrastructure/rabbitmq.yaml
+
+# 2. Control Plane (RBAC, NodePort 30000 Service, 2-replica Deployment) & ESS DaemonSet
+kubectl apply -f mapreduce-manager/app/k8s/manager/manager-rbac.yaml
+kubectl apply -f mapreduce-manager/app/k8s/manager/manager-service.yaml
+kubectl apply -f mapreduce-manager/app/k8s/manager/manager-deployment.yaml
+kubectl apply -f mapreduce-manager/app/k8s/templates/ess-daemonset.yaml
+```
+
+> **MinIO Image Pull Caveat:** If `minio/minio:latest` fails with `pull access denied` / `ImagePullBackOff` due to Docker Hub repository restrictions, switch the MinIO deployment image to Chainguard's drop-in MinIO image:
+> ```powershell
+> kubectl set image deployment/minio minio=cgr.dev/chainguard/minio:latest
+> ```
+
+> **Local E2E Auth Override:** `manager-deployment.yaml` sets `ENABLE_AUTH="true"` by default. For unauthenticated local E2E testing without issuing RS256 Keycloak JWTs, override on the live deployment:
+> ```powershell
+> kubectl set env deployment/manager-api ENABLE_AUTH=false
+> ```
+
+Verify all pods are `1/1 Running`:
+
+```powershell
+kubectl get pods -o wide
+```
+
+---
+
+## 🧪 Testing
+
+### Manager Unit, Integration & Live Cluster E2E Tests
+
+```powershell
 cd mapreduce-manager
-docker-compose up -d
+.\.venv\Scripts\Activate.ps1
 
+# Unit tests (48 tests)
+pytest tests/unit -q
+
+# Integration tests (Testcontainers Postgres & RabbitMQ)
+pytest tests/integration -q
+
+# Live Minikube E2E tests (compiles Java WordCount/CSV fixtures, seeds MinIO, runs K8s jobs)
+pytest tests/e2e -v
 ```
 
-Initialize the Database schema:
+Aligned PowerShell E2E runner scripts are also available in `mapreduce-manager/tests/e2e/` (`start_infra_and_seed.ps1`, `reset_and_run_default.ps1`, `reset_and_run_large_file.ps1`, `reset_and_run_multitenant.ps1`, `deep_purge.ps1`).
 
-```bash
-docker cp init-db.sql local-postgres:/tmp/init-db.sql
-docker exec local-postgres psql -U postgres -d dds_db -f /tmp/init-db.sql
+### Java Unit Tests (`mapreduce-node` & `mapreduce-ess`)
 
-```
+```powershell
+# Node Worker unit tests (exclude S3ClientServiceIntegrationTest when MinIO is not on localhost:9000)
+mvn -f mapreduce-node/pom.xml test "-Dtest=!S3ClientServiceIntegrationTest" "-Dsurefire.failIfNoSpecifiedTests=false"
 
-### 2. Building & Loading Container Images
-
-Compile the Java worker and ESS daemon, build their Docker images, and load them into your local Kubernetes cluster:
-
-```bash
-# Build Worker
-cd ../mapreduce-node
-docker build -t mapreduce-worker:v10 .
-
-# Build ESS
-cd ../mapreduce-ess
-docker build -t mapreduce-ess:v2 .
-
-# Load into Minikube
-minikube image load mapreduce-worker:v10
-minikube image load mapreduce-ess:v2
-
-```
-
-### 3. Deploying the Orchestrator
-
-Start the Manager API locally:
-
-```bash
-cd ../mapreduce-manager
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Run the active-active API
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-
+# External Shuffle Service unit & concurrency tests
+mvn -f mapreduce-ess/pom.xml test
 ```
 
 ---
 
 ## 👨‍💻 Writing a MapReduce Application
 
-Developers can write applications by pulling the `mapreduce-core` framework via JitPack and implementing the required generic interfaces:
+Developers can build jobs against `mapreduce-core` by implementing `Mapper`, optional `Combiner`, and `Reducer` interfaces:
 
 ```xml
 <dependency>
@@ -110,10 +152,9 @@ Developers can write applications by pulling the `mapreduce-core` framework via 
     <artifactId>mapreduce-core</artifactId>
     <version>main-SNAPSHOT</version>
 </dependency>
-
 ```
 
-*(See the `mapreduce-node/README.md` for detailed coding examples).*
+*(See [`mapreduce-node/README.md`](./mapreduce-node/README.md) for `Mapper`, `Combiner`, and `Reducer` code examples and Java 17 compilation commands).*
 
 ---
 

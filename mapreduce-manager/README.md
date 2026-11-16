@@ -1,77 +1,70 @@
 # MapReduce Orchestrator (Manager Service)
 
-The **MapReduce Orchestrator** is the central control plane for a distributed, Kubernetes-native MapReduce framework. Designed for cloud-native elasticity and high-throughput environments, the Manager handles job scheduling, multi-tenant sandboxing, O(1) memory data partitioning, and autonomous fault recovery across volatile compute clusters.
+The **MapReduce Orchestrator** (`mapreduce-manager/`) is the central control plane for the Kubernetes-native MapReduce framework. It handles multi-tenant job scheduling, O(1) memory data splitting, RabbitMQ task distribution, Redis barrier synchronization, Kubernetes Batch Job provisioning, and autonomous fault recovery.
 
 ---
 
 ## 🏗 Architecture Overview
 
-The Manager operates on an **Event-Driven, Active-Active Architecture**, decoupling HTTP API ingestion from asynchronous worker execution. System state is managed safely across three distinct persistence layers:
+The Manager operates as an **Event-Driven, Active-Active Service** backed by four infrastructure components:
 
-1. **PostgreSQL (`asyncpg`):** The persistent, ACID-compliant source of truth for multi-tenant Job history, telemetry, and lineage metadata.
-2. **Redis (`redis.asyncio`):** High-speed layer for Idempotency locks, Global Capacity Semaphores, Distributed Leader Election, and Lua-scripted Phase Barriers.
-3. **RabbitMQ (`aio-pika`):** Dynamic, job-specific message queues for zero-trust task routing, Dead Letter Exchanges (DLX), and asynchronous worker status signaling.
-4. **Kubernetes API:** Ephemeral infrastructure provisioning via dynamic Batch V1 Job manifests.
+1. **PostgreSQL (`asyncpg`):** ACID source of truth for multi-tenant job history, format metadata, and recovery state (`init-db.sql` / `app/k8s/infrastructure/postgres-configmap.yaml`).
+2. **Redis (`redis.asyncio`):** Idempotency locks, global worker capacity semaphores, Watchdog/Reconciler leader locks, Lua-scripted Map/Reduce completion barriers, and `job:<id>:worker_endpoints` shuffle routing tables.
+3. **RabbitMQ (`aio-pika`):** Dynamic lazy queues (`map_tasks_<jobId>`, `reduce_tasks_<jobId>`), `job_events_queue`, `orchestration_events_queue`, and a bound `FANOUT` Dead Letter Exchange (`dead_letter_exchange` -> `dead_letter_queue`).
+4. **Kubernetes API (`kubernetes_asyncio`):** Provisions `worker-template.yaml` Batch V1 Jobs (`mapreduce-worker:v10`) and cleans up phase-scoped jobs (`delete_job(job_id, phase=...)`).
 
 ---
 
-## ✨ Core Execution & Advanced Resilience
+## ✨ Core Execution & Resilience
 
 ### 1. O(1) Memory Footprint Data Partitioning
 
-Utilizes native Python Generators to calculate physical byte-range boundaries for massive datasets (e.g., multi-terabyte S3 objects). By yielding boundaries sequentially via the `Global Capacity Model`, the Orchestrator streams task assignments to RabbitMQ without ever allocating massive arrays in the Manager's local memory, completely preventing Out-Of-Memory (OOM) crashes during peak submission storms.
+Uses Python generators (`orchestrator.generate_chunk_splits`) to stream 128 MiB byte-range boundaries sequentially to RabbitMQ lazy queues without materializing giant split arrays in Manager memory.
 
-### 2. Multi-Tenant Sandboxing & Dynamic Binding
+### 2. Multi-Tenant Sandboxing & Format Propagation
 
-Data and computation are strictly isolated. The Manager dynamically derives Java execution class structures directly from the S3 user-code paths at runtime. It injects mathematically bounded, tenant-isolated S3 write scopes (`s3://results/<user_id>/<job_id>/`) directly into the worker payload envelopes to prevent cross-tenant data corruption.
+Tracks tenant ownership via `user_id`, derives Java class names from uploaded `.class` filenames, isolates output keys to `s3://results/<user_id>/<job_id>/`, and propagates `TaskMessage.format` (`JSON`, `AVRO`, `XML`, `TEXT`, `CSV`) end-to-end across initial scheduling, lineage recovery, and Reduce tasks.
 
 ### 3. Mid-Stream Local Reduction (Combiners)
 
-Supports dynamic injection of optional `Combiner` classes. The Manager securely routes this bytecode to Map workers, enabling in-memory mathematical folding of micro-batches prior to disk spillage. This drastically compresses the network shuffle payload at the source node and mitigates Reducer data skew (OOM) during Zipfian distribution processing.
+Persists `combiner_filename` in PostgreSQL (`init-db.sql` and `postgres-configmap.yaml`) and propagates optional `combiner_code_object` / `combiner_class_name` in both initial Map dispatches and `_recover_lost_map_task` lineage recoveries.
 
 ### 4. Stateful Barriers & Data Locality
 
-* **Lua-Backed Barriers:** Utilizes atomic Redis Lua scripts to safely track Map and Reduce completion signals across thousands of concurrent workers, eliminating distributed race conditions during phase transitions.
-* **Locality Scheduling:** Dynamically extracts ESS worker bind addresses during the Map phase and utilizes Kubernetes **Node Affinity** to schedule Reducer pods on the exact physical hardware holding the heaviest shuffle partitions, drastically reducing cross-rack network traffic.
+* **Lua-Backed Barriers:** Atomic Redis Lua scripts track unique completed task IDs (`map_completed_set`, `reduce_completed_set`) and trigger phase transitions exactly once.
+* **Locality Scheduling:** Splits `nodeName@@IP:Port` addresses reported by Map workers (`CacheRepository.add_worker_endpoint`), pins Reducer pods via soft Kubernetes `nodeAffinity` (`TARGET_NODE`), and supplies clean `IP:Port` ESS endpoints in `TaskMessage.worker_endpoints`.
+* **Phase-Scoped Teardown & Saga Rollback:** `process_orchestration_event` cleans up only Map-phase pods/queues under an idempotency lock (preserving `reduce_tasks_<jobId>`) and uses delayed backoff on cluster capacity starvation. `routes.py` cleans up `SUBMITTED` DB rows and reserved Redis capacity on `503`/`404` or Saga errors.
 
-### 5. Hybrid Retry & Fail-Fast Protection
+### 5. Hybrid Retry, Fail-Fast & Reactive Lineage Recovery
 
-* **Transient Infrastructure Faults:** Applies a bounded retry envelope for transient hardware or network errors, automatically provisioning replacement Kubernetes compute transparently to the user.
-* **Fail-Fast (Poison Pills):** Detects deterministic user-code exceptions (e.g., `UnsupportedClassVersionError`, `NullPointerException`) and immediately triggers an asynchronous Saga teardown. This prevents infinite retry loops from hijacking cluster resources.
-
-### 6. Reactive Lineage Recovery (Surgical Healing)
-
-If a Reducer experiences a `SHUFFLE_FETCH_FAILED` error, the Manager intercepts the precise failure topology. Instead of crashing the parent Job, it places the Reducer in a Redis waitlist and **surgically re-provisions** only the specific missing Map tasks, minimizing compute waste.
+* **Manager-Owned Retries & Fail-Fast:** Deterministic user-code errors (`NullPointerException`, `ClassCastException`, `OutOfMemoryError`, `Exception in User Code`) immediately trigger `forcefully_reclaim_job`; transient worker `FAILED` signals (`strikes < 3`) ACK the event signal, provision a replacement pod, and republish the failed Map or Reduce task.
+* **Node-Aware Lineage Recovery:** Handles both `SHUFFLE_FETCH_FAILED:<taskId>` and `SHUFFLE_FETCH_FAILED_FROM_NODE:<ip:port>` by looking up affected Map tasks in `job:{job_id}:worker_endpoints` (`CacheRepository.get_tasks_by_endpoint`), waitlisting the stalled Reducer, and surgically re-running only the lost Map chunks.
 
 ---
 
 ## 🤖 Autonomous Background Services
 
-To guarantee cluster stability in an Active-Active high-availability deployment, the Manager runs robust daemon services governed by **Redis-backed Distributed Leader Election** (preventing split-brain scenarios):
-
-* **The Watchdog (Garbage Collection):** A concurrent background sweep that detects stalled or orphaned jobs, forcefully reclaims Kubernetes resources (Pods/Queues), and releases mathematical capacity semaphores back to the global pool.
-* **The Reconciler (State Drift Correction):** Periodically audits Redis capacity locks against the live Kubernetes API. If it detects a "Phantom Reservation" (Redis claims capacity but 0 pods exist due to manual K8s intervention), it forcefully synchronizes the PostgreSQL state to prevent the cluster from deadlocking.
+* **The Watchdog (`app/services/watchdog.py`):** Periodically sweeps stale `RUNNING` jobs exceeding `GLOBAL_JOB_TIMEOUT` and invokes `forcefully_reclaim_job`.
+* **The Reconciler (`app/services/reconciler.py`):** Compares Redis capacity reservations against live Kubernetes pods and reclaims phantom allocations with zero active pods past the grace window.
 
 ---
 
 ## 🔬 Architectural Trade-offs & Future Scalability
 
-Operating a distributed control plane requires balancing state consistency with high-throughput API demands. The Orchestrator architecture acknowledges the following limits and trade-offs:
-
-1. **Redis CP vs. AP Guarantees:** We utilize Redis for distributed locking, phase barriers, and semaphores. While incredibly fast (AP), Redis standard clustering lacks the strict Consistency/Partition-Tolerance (CP) guarantees of consensus engines like `etcd` or Zookeeper. In a severe network partition scenario, split-brain locking is theoretically possible. A hyperscale enterprise iteration would migrate critical state semaphores to `etcd`.
-2. **Kubernetes API Polling vs. Informers:** The `Reconciler` service periodically queries the Kubernetes API server to detect state drift. At a massive scale (e.g., managing 10,000+ simultaneous worker pods), this polling architecture will trigger K8s control plane rate-limiting. Future iterations should replace polling with Kubernetes **SharedInformers** (Watch APIs) for zero-latency, event-driven state tracking.
-3. **Task Batching vs. Maximum Parallelism:** To protect the K8s control plane from Pod-Creation latency spikes, the `get_optimal_worker_count` function implements an autonomous 5:1 batching ratio. This trades maximum theoretical parallelism (spawning 100,000 pods for 100,000 tasks) for infrastructure stability, ensuring hardware is utilized efficiently rather than suffocating the K8s scheduler.
+1. **Redis CP vs. AP Guarantees:** Redis is single-replica without persistence in the baseline manifest; HA production deployments should add AOF/PVC or Sentinel plus fenced leader leases.
+2. **Kubernetes API Polling vs. Informers:** `wait_for_job_completion` and the `Reconciler` poll the Kubernetes API; large-scale clusters should migrate to Kubernetes SharedInformers and `Indexed` Reduce Jobs.
+3. **Task Batching vs. Maximum Parallelism:** `get_optimal_worker_count` defaults to `MAP_TASKS_PER_POD = 5` to amortize pod boot overhead across chunks.
 
 ---
 
 ## 🛠 Technology Stack
 
-* **Framework:** FastAPI (Asynchronous ASGI)
-* **Language:** Python 3.11+
-* **Database & ORM:** PostgreSQL (`asyncpg` / SQLAlchemy)
+* **Framework:** FastAPI (Asynchronous ASGI / Uvicorn)
+* **Language:** Python 3.11+ (tested on 3.13)
+* **Database:** PostgreSQL (`asyncpg`)
 * **Message Broker:** RabbitMQ (`aio-pika`)
-* **In-Memory Cache:** Redis (`redis.asyncio`)
-* **Infrastructure:** Kubernetes Client (`kubernetes_asyncio`)
+* **Cache & Barriers:** Redis (`redis.asyncio`)
+* **Infrastructure:** Kubernetes (`kubernetes_asyncio`), MinIO (`minio`)
 
 ---
 
@@ -79,98 +72,111 @@ Operating a distributed control plane requires balancing state consistency with 
 
 ### Prerequisites
 
-* Python 3.11+
-* A running Kubernetes cluster (Minikube, kind, or standard K8s)
-* Docker Compose (for local backing infrastructure)
+* **Python 3.11+**
+* **Minikube / Kubernetes** (`minikube start --driver=docker --memory=30720 --cpus=6 --nodes=1`)
+* **Docker**
 
-### Local Infrastructure Setup
+### Kubernetes Deployment (Minikube)
 
-Before launching the API, ensure your backing services are online:
+Build the Manager image inside Minikube's Docker daemon (`mapreduce-manager:v1`):
 
-```bash
-docker-compose up -d postgres rabbitmq redis minio
-
+```powershell
+& minikube -p minikube docker-env --shell powershell | Invoke-Expression
+docker build -t mapreduce-manager:v1 .
 ```
 
-### Installation
+Apply infrastructure, RBAC, Service (`NodePort 30000`), Deployment (`replicas: 2`), and ESS DaemonSet from `mapreduce-manager/`:
 
-1. **Clone the repository and navigate to the manager service:**
+```powershell
+kubectl apply -f app/k8s/infrastructure/postgres-configmap.yaml
+kubectl apply -f app/k8s/infrastructure/postgres.yaml
+kubectl apply -f app/k8s/infrastructure/redis.yaml
+kubectl apply -f app/k8s/infrastructure/minio.yaml
+kubectl apply -f app/k8s/infrastructure/rabbitmq.yaml
 
-```bash
-git clone <repository-url>
-cd mapreduce-orchestrator
+# Fallback if Docker Hub rejects minio/minio:latest pull:
+# kubectl set image deployment/minio minio=cgr.dev/chainguard/minio:latest
 
+kubectl apply -f app/k8s/manager/manager-rbac.yaml
+kubectl apply -f app/k8s/manager/manager-service.yaml
+kubectl apply -f app/k8s/manager/manager-deployment.yaml
+kubectl apply -f app/k8s/templates/ess-daemonset.yaml
+
+# Optional for unauthenticated local E2E testing:
+# kubectl set env deployment/manager-api ENABLE_AUTH=false
 ```
 
-2. **Create and activate a virtual environment:**
+### Local Development Setup (Docker Compose + Uvicorn)
+
+1. Start backing services from the sibling node directory (`../mapreduce-node/Docker-compose.yml`):
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
-
-```
-
-3. **Install dependencies:**
-
-```bash
-pip install -r requirements.txt
-
-```
-
-4. **Initialize the Database Schema:**
-
-```bash
-# Copy the schema file into the container and execute it natively to prevent PowerShell formatting corruption
+docker compose -f ../mapreduce-node/Docker-compose.yml up -d
 docker cp init-db.sql local-postgres:/tmp/init-db.sql
 docker exec local-postgres psql -U postgres -d dds_db -f /tmp/init-db.sql
-
 ```
 
-### Running the Service
+2. Create/activate `.venv` and install dependencies:
 
-Start the Orchestrator API using Uvicorn:
+```bash
+cd mapreduce-manager
+python -m venv .venv
+source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+3. Start the API:
 
 ```bash
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-
 ```
 
 * **API Documentation (Swagger UI):** `http://127.0.0.1:8000/docs`
-* **Health Check:** `http://127.0.0.1:8000/health`
 
 ---
 
 ## ⚙️ Configuration (Environment Variables)
 
-Configured via environment variables (see `app/core/config.py`). Create a `.env` file or export these in your shell:
+Configured via environment variables (see `app/core/config.py`):
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:password@localhost:5432/dds_db` |
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:DisSami2026!@localhost:5432/dds_db` |
 | `REDIS_URL` | Redis connection string | `redis://localhost:6379/0` |
 | `RABBITMQ_URL` | RabbitMQ connection string | `amqp://guest:guest@localhost:5672/` |
+| `MINIO_ENDPOINT` | MinIO S3 endpoint (`host:port`) | `localhost:9000` |
+| `MINIO_ACCESS_KEY` | MinIO access key | `minioadmin` |
+| `MINIO_SECRET_KEY` | MinIO secret key | `minioadmin` |
+| `MINIO_SECURE` | Enable TLS for MinIO client | `False` |
 | `K8S_NAMESPACE` | Kubernetes namespace for Workers | `default` |
 | `MAX_TOTAL_WORKERS` | Max concurrent pods allowed globally | `50` |
 | `CHUNK_SIZE_BYTES` | Default byte split for Map tasks | `134217728` (128MB) |
-| `MAP_TO_REDUCE_RATIO` | Configurable Map to Reduce partition ratio | `3` |
-| `MAP_TASKS_PER_POD` | Task batching size to amortize boot latency | `5` |
-| `GLOBAL_JOB_TIMEOUT` | Time before Watchdog kills a stalled job | `3600` (seconds) |
-| `MOCK_K8S` | Run with Mock infrastructure provider | `False` |
+| `MAP_TO_REDUCE_RATIO` | Default Map-to-Reduce partition ratio | `3` |
+| `MAP_TASKS_PER_POD` | Task batching size per Map pod | `5` |
+| `GLOBAL_JOB_TIMEOUT` | Seconds before Watchdog reclaims stalled jobs | `3600` |
+| `ENABLE_AUTH` | Enforce RS256 Bearer JWT auth (`true` in `manager-deployment.yaml`) | `False` |
+| `ESS_SECRET_KEY` | Shared HMAC-SHA256 secret for ESS tokens | `dev-insecure-shared-secret` |
+| `MOCK_K8S` | Run with mock Kubernetes provider | `False` |
+
+> **Worker Pod Sizing (`app/k8s/templates/worker-template.yaml`):** Sets `JAVA_OPTS="-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m"` inside `2Gi` memory limits so the parent worker and child `SandboxRunner` (`-XX:MaxRAMPercentage=50.0`) fit within the pod cgroup without `OOMKilled` (exit 137).
 
 ---
 
 ## 🧪 Testing
 
-The repository includes a comprehensive `pytest` suite covering unit logic, repository mocking, and integration with backend infrastructure.
-
-Run the test suite via:
-
 ```bash
-pytest -v
+# Unit tests (48 tests)
+pytest tests/unit -q
 
+# Integration tests (Testcontainers PostgreSQL & RabbitMQ)
+pytest tests/integration -q
+
+# Live Minikube E2E tests (requires running Minikube cluster with deployed services)
+pytest tests/e2e -v
 ```
+
+`tests/e2e/` includes `test_e2e_cluster.py`, Java fixtures under `tests/e2e/fixtures/`, and aligned PowerShell orchestration scripts (`start_infra_and_seed.ps1`, `reset_and_run_default.ps1`, `reset_and_run_large_file.ps1`, `reset_and_run_multitenant.ps1`, `deep_purge.ps1`).
 
 ---
 
-*Project for the 2026 Distributed Systems class, Technical University of Crete. Built by Ilias Bolanakis.* 
-
+*Project for the 2026 Distributed Systems class, Technical University of Crete. Built by Ilias Bolanakis.*

@@ -233,6 +233,31 @@ class CacheRepository:
         ]
 
     @staticmethod
+    async def get_tasks_by_endpoint(job_id: str, endpoint: str, redis_client: Redis) -> List[str]:
+        """
+        Retrieves all Map task IDs recorded against a failed ESS endpoint.
+
+        Matches exact endpoint strings or '<node_name>@@<endpoint>' entries
+        stored in the job's worker_endpoints Redis Hash.
+        """
+        if not endpoint:
+            return []
+
+        key = f"job:{job_id}:worker_endpoints"
+        raw_map = await cast(Awaitable[Any], redis_client.hgetall(key))
+        if not raw_map:
+            return []
+
+        matched_tasks: List[str] = []
+        for raw_task_id, raw_ep in raw_map.items():
+            task_id = raw_task_id.decode('utf-8') if isinstance(raw_task_id, bytes) else raw_task_id
+            ep = raw_ep.decode('utf-8') if isinstance(raw_ep, bytes) else raw_ep
+            if ep == endpoint or ep.endswith(f"@@{endpoint}"):
+                matched_tasks.append(task_id)
+
+        return matched_tasks
+
+    @staticmethod
     async def register_reduce_completion_atomic(
             job_id: str,
             task_id: str,

@@ -10,9 +10,12 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Stream;
 
 /**
@@ -81,6 +84,75 @@ public class StorageJanitor {
      * The MinIO storage service used for spilling data before physical deletion.
      */
     private static MinioStorageService minioStorageService;
+
+    /**
+     * Per-job lease and read/write lock registry protecting active MinIO restorations
+     * and active Reducer gRPC streams from premature garbage collection.
+     */
+    private static final ConcurrentHashMap<String, JobLeaseEntry> activeJobLeases = new ConcurrentHashMap<>();
+
+    private static final class JobLeaseEntry {
+        final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+        int refCount = 0;
+        final AtomicInteger activeLeases = new AtomicInteger(0);
+    }
+
+    /**
+     * Acquires an active reader/restore lease for {@code jobId}. Must be paired with
+     * {@link #releaseJobLease(String)} in a {@code finally} block.
+     */
+    public static void acquireJobLease(String jobId) {
+        if (jobId == null || jobId.isEmpty()) {
+            return;
+        }
+        JobLeaseEntry entry = activeJobLeases.compute(jobId, (k, existing) -> {
+            JobLeaseEntry e = (existing != null) ? existing : new JobLeaseEntry();
+            e.refCount++;
+            e.activeLeases.incrementAndGet();
+            return e;
+        });
+        entry.rwLock.readLock().lock();
+    }
+
+    /**
+     * Releases an active reader/restore lease for {@code jobId}.
+     */
+    public static void releaseJobLease(String jobId) {
+        if (jobId == null || jobId.isEmpty()) {
+            return;
+        }
+        JobLeaseEntry entry = activeJobLeases.get(jobId);
+        if (entry != null) {
+            entry.rwLock.readLock().unlock();
+        }
+        activeJobLeases.computeIfPresent(jobId, (k, existing) -> {
+            if (existing.activeLeases.get() > 0) {
+                existing.activeLeases.decrementAndGet();
+            }
+            if (--existing.refCount <= 0) {
+                return null;
+            }
+            return existing;
+        });
+    }
+
+    /**
+     * Returns the current number of active restore/stream leases for {@code jobId}.
+     */
+    public static int getActiveLeaseCount(String jobId) {
+        if (jobId == null || jobId.isEmpty()) {
+            return 0;
+        }
+        JobLeaseEntry entry = activeJobLeases.get(jobId);
+        return entry != null ? entry.activeLeases.get() : 0;
+    }
+
+    /**
+     * Returns {@code true} if {@code jobId} currently holds one or more active leases.
+     */
+    public static boolean hasActiveLease(String jobId) {
+        return getActiveLeaseCount(jobId) > 0;
+    }
 
     /**
      * Initializes and schedules the background Janitor thread to monitor storage health.
@@ -152,6 +224,16 @@ public class StorageJanitor {
      * @throws IOException If the directory listing or attribute access fails.
      */
     private static void reclaimSpace(Path rootPath, FileStore store, long totalSpace) throws IOException {
+        reclaimSpace(rootPath, store, totalSpace, minioStorageService);
+    }
+
+    /**
+     * Identifies and purges the oldest job directories until disk usage is restored
+     * to the Low-Watermark buffer. Skips any directory with active restore/stream
+     * leases or in-flight {@code .tmp} files/directories.
+     */
+    public static void reclaimSpace(Path rootPath, FileStore store, long totalSpace,
+                                    MinioStorageService storageService) throws IOException {
         List<Path> sortedJobs;
 
         // Collect and sort all subdirectories by pre-fetched creation time (Oldest First)
@@ -181,38 +263,80 @@ public class StorageJanitor {
                 break;
             }
 
-            // ARCHITECTURAL FIX: Active Task Protection
-            // Deeply inspects the job directory to prevent the Janitor from wiping out
-            // a job that is actively streaming data from the compute pods.
-            try (Stream<Path> jobFiles = Files.walk(jobDir)) {
-                boolean hasActiveWriters = jobFiles.anyMatch(p -> p.toString().endsWith(".tmp"));
-                if (hasActiveWriters) {
-                    logger.debug("Skipping job directory {} due to active .tmp writers (Job currently running).", jobDir.getFileName());
-                    continue;
-                }
-            } catch (IOException e) {
-                logger.warn("Failed to check for active writers in {}. Skipping to prevent data loss.", jobDir.getFileName());
+            String jobId = jobDir.getFileName().toString();
+
+            // Active Lease Protection: Skip jobs currently being restored from MinIO or streamed to Reducers
+            if (hasActiveLease(jobId)) {
+                logger.debug("Skipping job directory {} due to active restore/stream lease.", jobId);
                 continue;
             }
 
-            String jobId = jobDir.getFileName().toString();
+            // ARCHITECTURAL FIX: Active Task Protection
+            // Deeply inspects the job directory to prevent the Janitor from wiping out
+            // a job that has active .tmp writers or .tmp restore staging directories.
+            if (hasActiveTmpEntries(jobDir)) {
+                logger.debug("Skipping job directory {} due to active .tmp entries.", jobId);
+                continue;
+            }
+
             logger.info("Reclaiming Space: Spilling job directory to MinIO -> {}", jobId);
 
             try {
                 // Spill the data to MinIO before deleting it from local disk
-                if (minioStorageService != null) {
-                    minioStorageService.spillJobData(jobId, jobDir);
+                if (storageService != null) {
+                    storageService.spillJobData(jobId, jobDir);
                 } else {
                     logger.warn("MinioStorageService is not initialized. Proceeding with hard deletion!");
                 }
 
-                logger.info("Spill complete. Purging local directory -> {}", jobId);
-                deleteDirectoryRecursively(jobDir);
+                // Re-verify active leases & acquire write lock atomically before local deletion
+                deleteJobDirIfIdle(jobId, jobDir);
             } catch (IOException e) {
                 logger.error("Failed to spill job directory {}. Skipping local deletion to prevent data loss.", jobId, e);
                 // By failing safely and skipping the local deletion, we ensure data reliability
                 // over disk space in the event of an object storage outage.
             }
+        }
+    }
+
+    private static boolean hasActiveTmpEntries(Path jobDir) {
+        try (Stream<Path> jobFiles = Files.walk(jobDir)) {
+            return jobFiles.anyMatch(p -> p.toString().endsWith(".tmp"));
+        } catch (IOException e) {
+            logger.warn("Failed to check for active .tmp entries in {}. Skipping to prevent data loss.", jobDir.getFileName());
+            return true;
+        }
+    }
+
+    private static void deleteJobDirIfIdle(String jobId, Path jobDir) throws IOException {
+        JobLeaseEntry entry = activeJobLeases.compute(jobId, (k, existing) -> {
+            JobLeaseEntry e = (existing != null) ? existing : new JobLeaseEntry();
+            e.refCount++;
+            return e;
+        });
+
+        try {
+            if (entry.activeLeases.get() > 0 || !entry.rwLock.writeLock().tryLock()) {
+                logger.debug("Skipping local deletion of {} because a restore/stream lease became active during spill.", jobId);
+                return;
+            }
+            try {
+                if (entry.activeLeases.get() > 0 || hasActiveTmpEntries(jobDir)) {
+                    logger.debug("Skipping local deletion of {} because an active lease or .tmp entry appeared during spill.", jobId);
+                    return;
+                }
+                logger.info("Spill complete. Purging local directory -> {}", jobId);
+                deleteDirectoryRecursively(jobDir);
+            } finally {
+                entry.rwLock.writeLock().unlock();
+            }
+        } finally {
+            activeJobLeases.computeIfPresent(jobId, (k, existing) -> {
+                if (--existing.refCount <= 0) {
+                    return null;
+                }
+                return existing;
+            });
         }
     }
 
@@ -229,10 +353,14 @@ public class StorageJanitor {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(rootPath)) {
             for (Path jobDir : stream) {
                 if (Files.isDirectory(jobDir)) {
+                    String jobId = jobDir.getFileName().toString();
+                    if (hasActiveLease(jobId) || hasActiveTmpEntries(jobDir)) {
+                        continue;
+                    }
                     BasicFileAttributes attrs = Files.readAttributes(jobDir, BasicFileAttributes.class);
                     if (attrs.creationTime().toMillis() < cutoff) {
-                        logger.info("Hard TTL Expired for Job: {}. Purging data...", jobDir.getFileName());
-                        deleteDirectoryRecursively(jobDir);
+                        logger.info("Hard TTL Expired for Job: {}. Purging data...", jobId);
+                        deleteJobDirIfIdle(jobId, jobDir);
                     }
                 }
             }

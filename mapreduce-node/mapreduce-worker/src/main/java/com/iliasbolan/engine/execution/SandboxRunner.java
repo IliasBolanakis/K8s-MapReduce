@@ -86,8 +86,8 @@ public class SandboxRunner {
 
             MinioConnectionManager manager = new MinioConnectionManager(
                     System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000"),
-                    System.getenv().getOrDefault("MINIO_ACCESS_KEY", "minioadmin"),
-                    System.getenv().getOrDefault("MINIO_SECRET_KEY", "minioadmin")
+                    resolveEnvFallback(System.getenv(), "MINIO_ACCESS_KEY", "MINIO_ROOT_USER", "minioadmin"),
+                    resolveEnvFallback(System.getenv(), "MINIO_SECRET_KEY", "MINIO_ROOT_PASSWORD", "minioadmin")
             );
             S3ClientService s3ClientService = new S3ClientService(manager);
 
@@ -109,6 +109,22 @@ public class SandboxRunner {
             logger.error("FATAL: Sandbox JVM encountered an unrecoverable exception.", t);
             System.exit(1);
         }
+    }
+
+    /**
+     * Resolves a configuration value by checking a primary environment key, falling back
+     * to a secondary key, and finally returning a default value when both are unset or empty.
+     */
+    static String resolveEnvFallback(java.util.Map<String, String> env, String primaryKey, String fallbackKey, String defaultValue) {
+        String primary = env.get(primaryKey);
+        if (primary != null && !primary.isEmpty()) {
+            return primary;
+        }
+        String fallback = env.get(fallbackKey);
+        if (fallback != null && !fallback.isEmpty()) {
+            return fallback;
+        }
+        return defaultValue;
     }
 
     /**

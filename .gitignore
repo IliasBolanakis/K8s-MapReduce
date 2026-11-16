@@ -1,0 +1,23 @@
+# IDE / Local Tooling
+.vscode/
+
+# Local-only architecture audit artifact
+ENTERPRISE_ARCHITECTURE_CRITIQUE.md
+STATE.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Java / Maven / Gradle
+target/
+build/
+.gradle/
+*.class
+
+# Environment / Secrets / Logs
+.env
+*.env
+*.log

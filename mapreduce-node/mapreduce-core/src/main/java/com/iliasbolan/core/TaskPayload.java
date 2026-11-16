@@ -28,6 +28,7 @@ import java.util.List;
  * @param combinerCodeObject The optional MinIO object key for the user's compiled Combiner optimization code.
  * @param combinerClassName  The optional fully qualified name of the user's Combiner class.
  * @param workerEndpoints    A routing table of network addresses (IP:Port) for active physical ESS nodes.
+ * @param format             The input data format (e.g., <code>"TEXT"</code>).
  *
  * @author Ilias Bolanakis
  * @version 2.1
@@ -49,5 +50,6 @@ public record TaskPayload(
         String className,
         String combinerCodeObject,
         String combinerClassName,
-        List<String> workerEndpoints
+        List<String> workerEndpoints,
+        String format
 ) {}

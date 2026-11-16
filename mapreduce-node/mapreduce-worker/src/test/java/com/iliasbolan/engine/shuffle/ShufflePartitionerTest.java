@@ -7,16 +7,24 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 
 /**
  * Unit test suite for the ShufflePartitioner component.
@@ -113,6 +121,97 @@ class ShufflePartitionerTest {
 
         assertTrue(Files.exists(expectedPath), "Local file does not follow the deterministic naming convention.");
         assertTrue(expectedPath.toString().endsWith(".lz4"), "The local file must have a .lz4 extension for the binary data plane.");
+    }
+
+    @Test
+    void testAtomicStaging_WritesToTmpUntilClosePromotesToLz4() throws IOException {
+        String testKey = "atomic-key";
+        int expectedPartition = (testKey.hashCode() & Integer.MAX_VALUE) % 3;
+        Path partitionDir = tempDir.resolve(testJobId).resolve(String.valueOf(expectedPartition));
+        Path tmpPath = partitionDir.resolve(testMapId + ".tmp");
+        Path finalPath = partitionDir.resolve(testMapId + ".lz4");
+
+        partitioner.appendThreadSafe(List.of(new KeyValuePair(testKey, "1")));
+
+        assertTrue(Files.exists(tmpPath), "Active partition should write to .tmp before close()");
+        assertFalse(Files.exists(finalPath), ".lz4 must not exist before close() finalizes the stream");
+
+        partitioner.close();
+
+        assertFalse(Files.exists(tmpPath), ".tmp must be removed after atomic move on close()");
+        assertTrue(Files.exists(finalPath), ".lz4 must exist after close()");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFailureCleanup_FlushFailureDeletesTmpAndLeavesNoLz4() throws Exception {
+        int failingPartition = 0;
+        Path partitionDir = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition));
+        Path tmpPath = partitionDir.resolve(testMapId + ".tmp");
+        Path finalPath = partitionDir.resolve(testMapId + ".lz4");
+        Files.writeString(tmpPath, "partial-data");
+
+        BufferedWriter failingWriter = mock(BufferedWriter.class);
+        doThrow(new IOException("Simulated flush failure")).when(failingWriter).flush();
+
+        Field cacheField = ShufflePartitioner.class.getDeclaredField("writerCache");
+        cacheField.setAccessible(true);
+        ConcurrentHashMap<Integer, BufferedWriter> cache =
+                (ConcurrentHashMap<Integer, BufferedWriter>) cacheField.get(partitioner);
+        cache.put(failingPartition, failingWriter);
+
+        partitioner.close();
+
+        assertFalse(Files.exists(tmpPath), "Stale .tmp file must be deleted on flush failure");
+        assertFalse(Files.exists(finalPath), "Partial .lz4 file must not be created on flush failure");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFailureCleanup_WriteFailureDeletesAllTmpFilesOnClose() throws Exception {
+        String okKey = "ok-key";
+        int okPartition = (okKey.hashCode() & Integer.MAX_VALUE) % 3;
+        int failingPartition = (okPartition + 1) % 3;
+
+        partitioner.appendThreadSafe(List.of(new KeyValuePair(okKey, "1")));
+        Path okTmp = tempDir.resolve(testJobId).resolve(String.valueOf(okPartition)).resolve(testMapId + ".tmp");
+        Path okLz4 = tempDir.resolve(testJobId).resolve(String.valueOf(okPartition)).resolve(testMapId + ".lz4");
+        assertTrue(Files.exists(okTmp));
+
+        // Pick a key that hashes to failingPartition
+        String failKey = findKeyForPartition(failingPartition, 3);
+        Path failTmp = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition)).resolve(testMapId + ".tmp");
+        Path failLz4 = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition)).resolve(testMapId + ".lz4");
+        Files.writeString(failTmp, "partial");
+
+        BufferedWriter failingWriter = mock(BufferedWriter.class);
+        doThrow(new IOException("Simulated write failure")).when(failingWriter).write(anyString());
+
+        Field cacheField = ShufflePartitioner.class.getDeclaredField("writerCache");
+        cacheField.setAccessible(true);
+        ConcurrentHashMap<Integer, BufferedWriter> cache =
+                (ConcurrentHashMap<Integer, BufferedWriter>) cacheField.get(partitioner);
+        cache.put(failingPartition, failingWriter);
+
+        assertThrows(IOException.class,
+                () -> partitioner.appendThreadSafe(List.of(new KeyValuePair(failKey, "1"))));
+
+        partitioner.close();
+
+        assertFalse(Files.exists(okTmp), "All .tmp files must be deleted after a write failure");
+        assertFalse(Files.exists(okLz4), "No .lz4 file may be promoted after a write failure");
+        assertFalse(Files.exists(failTmp), "Failing partition .tmp file must be deleted");
+        assertFalse(Files.exists(failLz4), "Failing partition .lz4 file must not exist");
+    }
+
+    private String findKeyForPartition(int targetPartition, int numReducers) {
+        for (int i = 0; i < 1000; i++) {
+            String candidate = "key-" + i;
+            if ((candidate.hashCode() & Integer.MAX_VALUE) % numReducers == targetPartition) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("Could not find key for partition " + targetPartition);
     }
 
     /**

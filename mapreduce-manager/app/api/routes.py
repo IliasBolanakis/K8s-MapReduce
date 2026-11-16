@@ -201,16 +201,27 @@ async def handle_schedule_job(
             total_chunks, phase="map", num_reducers=actual_reducers, num_mappers=actual_mappers
         )
 
-        replicas: int = await CacheRepository.reserve_cluster_capacity(
-            job_id=job_id_str,
-            requested_mappers=ideal_mappers,
-            num_reducers=actual_reducers,
-            max_capacity=settings.MAX_TOTAL_WORKERS,
-            redis_client=redis_client
-        )
+        try:
+            replicas: int = await CacheRepository.reserve_cluster_capacity(
+                job_id=job_id_str,
+                requested_mappers=ideal_mappers,
+                num_reducers=actual_reducers,
+                max_capacity=settings.MAX_TOTAL_WORKERS,
+                redis_client=redis_client
+            )
+        except Exception:
+            try:
+                await JobRepository.mark_job_failed(job_id_str, db_pool)
+            except Exception as rollback_err:
+                logger.error("Failed to mark job %s FAILED after capacity reservation error: %s", job_id_str, rollback_err)
+            raise
 
         if replicas == 0:
             logger.error("Resource allocation denied: Cluster limits saturated (Ceiling: %d)", settings.MAX_TOTAL_WORKERS)
+            try:
+                await JobRepository.mark_job_failed(job_id_str, db_pool)
+            except Exception as rollback_err:
+                logger.error("Failed to mark job %s FAILED after 503 capacity denial: %s", job_id_str, rollback_err)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="The execution cluster has reached its multi-tenant limit. Re-submit request when active workloads finish."
@@ -222,13 +233,24 @@ async def handle_schedule_job(
         derived_mapper_class: str = payload.mapper_filename.rsplit('.class', 1)[0]
         derived_combiner_class: Optional[str] = payload.combiner_filename.rsplit('.class', 1)[0] if payload.combiner_filename else None
 
-        await JobRepository.transition_job_to_running(
-            job_id=job_id_str,
-            total_chunks=total_chunks,
-            num_reducers=actual_reducers,
-            db_pool=db_pool,
-            num_mappers=actual_mappers
-        )
+        try:
+            await JobRepository.transition_job_to_running(
+                job_id=job_id_str,
+                total_chunks=total_chunks,
+                num_reducers=actual_reducers,
+                db_pool=db_pool,
+                num_mappers=actual_mappers
+            )
+        except Exception:
+            try:
+                await CacheRepository.release_job_capacity(job_id_str, redis_client)
+            except Exception as cap_err:
+                logger.error("Failed to release Redis capacity for job %s during rollback: %s", job_id_str, cap_err)
+            try:
+                await JobRepository.mark_job_failed(job_id_str, db_pool)
+            except Exception as db_err:
+                logger.error("Failed to mark job %s FAILED during transition rollback: %s", job_id_str, db_err)
+            raise
 
         # --- PHASE 5: ELASTIC DEPLOYMENT SAGA BOUNDARY ---
         # Enforce step-by-step containment limits over external side effects. If external deployment
@@ -250,7 +272,8 @@ async def handle_schedule_job(
                 num_reducers=actual_reducers,
                 mq_channel=mq_channel,
                 combiner_obj=combiner_obj,
-                combiner_class=derived_combiner_class
+                combiner_class=derived_combiner_class,
+                file_format=payload.format
             )
 
             # Task Segment C: Document Processing State & Commit Safe Results

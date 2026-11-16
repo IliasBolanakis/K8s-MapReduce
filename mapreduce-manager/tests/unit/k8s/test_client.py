@@ -95,11 +95,14 @@ def mock_k8s_api(mocker: Any) -> Dict[str, MagicMock]:
     mock_batch_cls.return_value.create_namespaced_job = mock_create_job
     mock_list_jobs = AsyncMock()
     mock_batch_cls.return_value.list_namespaced_job = mock_list_jobs
+    mock_delete_job = AsyncMock()
+    mock_batch_cls.return_value.delete_namespaced_job = mock_delete_job
 
     return {
         "api_instance": api_instance,
         "create_job": mock_create_job,
-        "list_jobs": mock_list_jobs
+        "list_jobs": mock_list_jobs,
+        "delete_job": mock_delete_job,
     }
 
 
@@ -229,3 +232,74 @@ async def test_wait_for_job_completion_polling_logic(
     await provider.wait_for_job_completion(job_id="poll-test")
 
     assert mock_k8s_api["list_jobs"].call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_job_phase_scoped_map_preserves_reduce(
+    mocker: Any,
+    mock_settings: None,
+    mock_k8s_api: Dict[str, Any]
+) -> None:
+    """
+    Verifies delete_job(job_id, phase='map') filters by exact job_id label selector,
+    deletes only map K8s Jobs, and leaves reduce_tasks_{job_id} intact.
+    """
+    job_id = "12345678-1111-2222-3333-444444444444"
+    mq_mock = AsyncMock()
+    mocker.patch("app.k8s.client.get_rabbitmq_channel", new_callable=AsyncMock, return_value=mq_mock)
+    mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
+
+    map_job = MagicMock()
+    map_job.metadata.name = "worker-map-12345678-abcde"
+    map_job.metadata.labels = {"job_id": job_id, "phase": "map"}
+
+    reduce_job = MagicMock()
+    reduce_job.metadata.name = "worker-reduce-12345678-p0-fghij"
+    reduce_job.metadata.labels = {"job_id": job_id, "phase": "reduce"}
+
+    mock_k8s_api["list_jobs"].return_value = MagicMock(items=[map_job, reduce_job])
+
+    provider = RealKubernetesProvider()
+    await provider.delete_job(job_id, phase="map")
+
+    mq_mock.queue_delete.assert_called_once_with(f"map_tasks_{job_id}")
+    mock_k8s_api["list_jobs"].assert_called_once_with(
+        namespace="test-namespace",
+        label_selector=f"job_id={job_id}"
+    )
+    mock_k8s_api["delete_job"].assert_called_once_with(
+        name="worker-map-12345678-abcde",
+        namespace="test-namespace",
+        propagation_policy="Background"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_job_all_phases(
+    mocker: Any,
+    mock_settings: None,
+    mock_k8s_api: Dict[str, Any]
+) -> None:
+    """
+    Verifies delete_job(job_id) without phase cleans up both map and reduce queues and all job K8s jobs.
+    """
+    job_id = "12345678-1111-2222-3333-444444444444"
+    mq_mock = AsyncMock()
+    mocker.patch("app.k8s.client.get_rabbitmq_channel", new_callable=AsyncMock, return_value=mq_mock)
+    mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
+
+    map_job = MagicMock()
+    map_job.metadata.name = "worker-map-12345678-abcde"
+    map_job.metadata.labels = {"job_id": job_id}
+
+    reduce_job = MagicMock()
+    reduce_job.metadata.name = "worker-reduce-12345678-p0-fghij"
+    reduce_job.metadata.labels = {"job_id": job_id}
+
+    mock_k8s_api["list_jobs"].return_value = MagicMock(items=[map_job, reduce_job])
+
+    provider = RealKubernetesProvider()
+    await provider.delete_job(job_id)
+
+    assert mq_mock.queue_delete.call_count == 2
+    assert mock_k8s_api["delete_job"].call_count == 2

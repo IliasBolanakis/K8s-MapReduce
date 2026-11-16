@@ -76,12 +76,13 @@ class KubernetesProvider(ABC):
         pass
 
     @abstractmethod
-    async def delete_job(self, job_id: str) -> None:
+    async def delete_job(self, job_id: str, phase: Optional[str] = None) -> None:
         """
         Clean up Kubernetes resources and message queues associated with a specific job.
 
         Args:
             job_id: The job identifier whose resources should be purged.
+            phase: Optional execution phase ('map' or 'reduce') to scope deletion.
         """
         pass
 
@@ -245,30 +246,29 @@ class RealKubernetesProvider(KubernetesProvider):
 
             logger.error("Timeout reached for job %s after %ss.", safe_job_id, timeout_seconds)
 
-    async def delete_job(self, job_id: str) -> None:
+    async def delete_job(self, job_id: str, phase: Optional[str] = None) -> None:
         """
-        Purges all Kubernetes Job resources and dynamic message queues
-        identified by the job_id label.
+        Purges Kubernetes Job resources and dynamic message queues
+        identified by the job_id label (optionally scoped to a specific phase).
 
         Args:
             job_id: The job ID used to find resources for deletion.
+            phase: Optional execution phase ('map' or 'reduce') to limit cleanup.
         """
-        logger.info("Initiating resource cleanup for finished job.")
+        logger.info("Initiating resource cleanup for job %s (phase=%s).", job_id, phase or "all")
         # Brief sleep ensures log aggregation completes before resource removal
         await asyncio.sleep(5)
 
         safe_job_id = str(job_id)[:8]
 
-        # Clean up dynamic RabbitMQ queues associated with the job
+        # Clean up dynamic RabbitMQ queues associated with the job/phase
         try:
             mq_channel = await get_rabbitmq_channel()
-            map_queue = f"map_tasks_{job_id}"
-            reduce_queue = f"reduce_tasks_{job_id}"
-
-            # Delete queues if they exist (if_unused/if_empty flags can be added if needed)
-            await mq_channel.queue_delete(map_queue)
-            await mq_channel.queue_delete(reduce_queue)
-            logger.info("Successfully deleted dynamic RabbitMQ queues for job %s.", safe_job_id)
+            if phase is None or phase == "map":
+                await mq_channel.queue_delete(f"map_tasks_{job_id}")
+            if phase is None or phase == "reduce":
+                await mq_channel.queue_delete(f"reduce_tasks_{job_id}")
+            logger.info("Successfully deleted dynamic RabbitMQ queues (phase=%s) for job %s.", phase or "all", safe_job_id)
         except Exception as e:
             logger.error("Failed to delete RabbitMQ queues for job %s: %s", safe_job_id, str(e))
         # ---------------------------------------------------------
@@ -277,17 +277,31 @@ class RealKubernetesProvider(KubernetesProvider):
             batch_v1 = client.BatchV1Api(api_client)
 
             try:
-                job_list = await batch_v1.list_namespaced_job(namespace=settings.K8S_NAMESPACE)
+                job_list = await batch_v1.list_namespaced_job(
+                    namespace=settings.K8S_NAMESPACE,
+                    label_selector=f"job_id={job_id}"
+                )
 
                 for k8s_job in job_list.items:
-                    if k8s_job.metadata.name and safe_job_id in k8s_job.metadata.name:
-                        # Use Background propagation to ensure Pods are also cleaned up
-                        await batch_v1.delete_namespaced_job(
-                            name=k8s_job.metadata.name,
-                            namespace=settings.K8S_NAMESPACE,
-                            propagation_policy="Background"
-                        )
-                        logger.info("Deleted K8s Job resource: %s", k8s_job.metadata.name)
+                    if not k8s_job.metadata or not k8s_job.metadata.name:
+                        continue
+
+                    if phase is not None:
+                        labels = k8s_job.metadata.labels or {}
+                        job_phase = labels.get("phase")
+                        if job_phase is not None:
+                            if job_phase != phase:
+                                continue
+                        elif not k8s_job.metadata.name.startswith(f"worker-{phase}-"):
+                            continue
+
+                    # Use Background propagation to ensure Pods are also cleaned up
+                    await batch_v1.delete_namespaced_job(
+                        name=k8s_job.metadata.name,
+                        namespace=settings.K8S_NAMESPACE,
+                        propagation_policy="Background"
+                    )
+                    logger.info("Deleted K8s Job resource: %s", k8s_job.metadata.name)
 
             except ApiException as e:
                 logger.error("Failed to clean up Kubernetes resources for job %s: %s", job_id, e.body)
@@ -320,9 +334,9 @@ class MockKubernetesProvider(KubernetesProvider):
         logger.info("[MOCK] Waiting for job %s completion...", job_id)
         await asyncio.sleep(1)
 
-    async def delete_job(self, job_id: str) -> None:
+    async def delete_job(self, job_id: str, phase: Optional[str] = None) -> None:
         """Logs the simulation of resource and queue cleanup."""
-        logger.info("[MOCK] Cleaning up K8s resources and MQ queues for job %s", job_id)
+        logger.info("[MOCK] Cleaning up K8s resources and MQ queues for job %s (phase=%s)", job_id, phase or "all")
 
 
 # Global singleton instance holder for the provider

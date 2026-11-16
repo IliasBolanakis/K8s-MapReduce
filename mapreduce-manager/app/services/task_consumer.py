@@ -103,40 +103,61 @@ class TaskEventProcessor:
             if payload.status != "COMPLETED":
 
                 # 1. Lineage Recovery (Surgical Shuffle Healing)
-                if payload.error and payload.error.startswith("SHUFFLE_FETCH_FAILED:"):
-                    lost_task_id = payload.error.split(":")[1]
-                    logger.warning("Reactive Lineage Recovery Triggered for '%s'.", lost_task_id)
-
+                if payload.error and (
+                    payload.error.startswith("SHUFFLE_FETCH_FAILED:")
+                    or payload.error.startswith("SHUFFLE_FETCH_FAILED_FROM_NODE:")
+                ):
                     redis_client = await get_redis_client()
+                    if payload.error.startswith("SHUFFLE_FETCH_FAILED_FROM_NODE:"):
+                        failed_endpoint = payload.error.split(":", 1)[1]
+                        lost_task_ids = await CacheRepository.get_tasks_by_endpoint(
+                            job_id_str, failed_endpoint, redis_client
+                        )
+                        logger.warning(
+                            "Node-level Shuffle Failure from '%s'. Affected map tasks: %s",
+                            failed_endpoint, lost_task_ids
+                        )
+                    else:
+                        lost_task_id = payload.error.split(":", 1)[1]
+                        lost_task_ids = [lost_task_id] if lost_task_id else []
 
-                    # Bounded Retry for Lineage Recovery (Prevents Infinite Loop)
-                    recovery_strikes = await CacheRepository.increment_task_failure(
-                        job_id_str, f"recovery_attempts_{lost_task_id}", redis_client
-                    )
+                    if lost_task_ids:
+                        for lost_task_id in lost_task_ids:
+                            logger.warning("Reactive Lineage Recovery Triggered for '%s'.", lost_task_id)
 
-                    if recovery_strikes >= 3:
-                        logger.error("Poison Pill Triggered: Lineage Recovery failed 3 times for %s.", lost_task_id)
-                        db_pool = await get_db_pool()
-                        k8s_provider = await get_k8s_provider()
+                            # Bounded Retry for Lineage Recovery (Prevents Infinite Loop)
+                            recovery_strikes = await CacheRepository.increment_task_failure(
+                                job_id_str, f"recovery_attempts_{lost_task_id}", redis_client
+                            )
 
-                        # Centralized lifecycle teardown
-                        await forcefully_reclaim_job(job_id_str, db_pool, k8s_provider, redis_client)
+                            if recovery_strikes >= 3:
+                                logger.error("Poison Pill Triggered: Lineage Recovery failed 3 times for %s.", lost_task_id)
+                                db_pool = await get_db_pool()
+                                k8s_provider = await get_k8s_provider()
 
-                        await message.reject(requeue=False)
+                                # Centralized lifecycle teardown
+                                await forcefully_reclaim_job(job_id_str, db_pool, k8s_provider, redis_client)
+
+                                await message.reject(requeue=False)
+                                return
+
+                            await CacheRepository.add_to_recovery_waitlist(
+                                job_id_str, lost_task_id, payload.task_id, redis_client
+                            )
+
+                            # Thundering Herd Protection (Prevents Duplicate K8s Spawns)
+                            recovery_lock_key = f"job:{job_id_str}:recovering:{lost_task_id}"
+                            if await redis_client.set(recovery_lock_key, "LOCKED", nx=True, ex=300):
+                                await cls._recover_lost_map_task(job_id_str, lost_task_id)
+                            else:
+                                logger.debug("Recovery already in progress for %s. Skipping duplicate spawn.", lost_task_id)
+
                         return
 
-                    await CacheRepository.add_to_recovery_waitlist(
-                        job_id_str, lost_task_id, payload.task_id, redis_client
+                    logger.warning(
+                        "No map tasks found for shuffle failure '%s' in job %s; falling back to task retry.",
+                        payload.error, job_id_str
                     )
-
-                    # Thundering Herd Protection (Prevents Duplicate K8s Spawns)
-                    recovery_lock_key = f"job:{job_id_str}:recovering:{lost_task_id}"
-                    if await redis_client.set(recovery_lock_key, "LOCKED", nx=True, ex=300):
-                        await cls._recover_lost_map_task(job_id_str, lost_task_id)
-                    else:
-                        logger.debug("Recovery already in progress for %s. Skipping duplicate spawn.", lost_task_id)
-
-                    return
 
                 # 2. Smart Retry Loop: Detect Deterministic vs. Transient Errors
                 deterministic_errors = ["NullPointerException", "ClassCastException", "OutOfMemoryError",
@@ -159,12 +180,27 @@ class TaskEventProcessor:
                         "Task %s failed (Strike %d/3). Error: %s. Provisioning replacement compute.",
                         payload.task_id, strikes, payload.error
                     )
-                    await message.reject(requeue=True)
-
-                    # Provision 1 exact replacement pod
-                    k8s_provider = await get_k8s_provider()
-                    target_phase = "map" if "map" in payload.task_id.lower() else "reduce"
-                    await k8s_provider.spawn_workers(job_id=job_id_str, replicas=1, phase=target_phase)
+                    if "map" in payload.task_id.lower():
+                        await cls._recover_lost_map_task(job_id_str, payload.task_id)
+                    elif payload.task_id.isdigit():
+                        db_pool = await get_db_pool()
+                        metadata = await JobRepository.get_job_metadata(job_id_str, db_pool)
+                        if not metadata:
+                            logger.error("Task retry aborted: Job metadata not found for %s", job_id_str)
+                            return
+                        derived_reducer_class = metadata['reducer_filename'].rsplit('.class', 1)[0]
+                        await cls._trigger_reduce_phase(
+                            job_id=job_id_str,
+                            user_id=str(metadata['user_id']),
+                            reducer_filename=metadata['reducer_filename'],
+                            reducer_class=derived_reducer_class,
+                            num_reducers=metadata['num_reducers'],
+                            target_partition_id=int(payload.task_id),
+                            file_format=metadata.get('format', 'TEXT')
+                        )
+                    else:
+                        k8s_provider = await get_k8s_provider()
+                        await k8s_provider.spawn_workers(job_id=job_id_str, replicas=1, phase="reduce")
                     return
 
                 # 3. Poison Pill Teardown (Strike 3 or User Code Bug)
@@ -224,6 +260,10 @@ class TaskEventProcessor:
 
             # --- DYNAMIC CLASS DERIVATION ---
             derived_mapper_class = record['mapper_filename'].rsplit('.class', 1)[0]
+            combiner_filename = record.get('combiner_filename')
+            combiner_obj = f"{user_id_str}/{combiner_filename}" if combiner_filename else None
+            derived_combiner_class = combiner_filename.rsplit('.class', 1)[0] if combiner_filename else None
+            file_format = record.get('format') or "TEXT"
 
             # Re-provision compute for the recovered task
             logger.info("Re-provisioning 1 Map worker for lineage recovery.")
@@ -239,7 +279,10 @@ class TaskEventProcessor:
                 file_size=file_size, s3_input_uri=constructed_input_uri, # type: ignore
                 mapper_bucket=mapper_bucket, mapper_obj=mapper_obj,
                 mapper_class=derived_mapper_class, num_reducers=record['num_reducers'],
-                mq_channel=mq_channel
+                mq_channel=mq_channel,
+                combiner_obj=combiner_obj,
+                combiner_class=derived_combiner_class,
+                file_format=file_format
             )
         except Exception as e:
             logger.error("Failed to execute lineage recovery: %s", str(e))
@@ -274,16 +317,24 @@ class TaskEventProcessor:
                 await message.reject(requeue=False)
                 return
 
+            if metadata.get("status") in ("FAILED", "COMPLETED"):
+                logger.info("Skipping orchestration transition for terminal job %s (%s).", job_id, metadata.get("status"))
+                return
+
             # --- Active Phase Garbage Collection ---
-            logger.info("Map phase complete. Actively tearing down Map pods to free capacity.")
             k8s_provider = await get_k8s_provider()
             redis_client = await get_redis_client()
 
-            # STEP 1: Teardown physical K8s Map pods FIRST
-            await k8s_provider.delete_job(job_id)
+            cleanup_lock_key = f"job:{job_id}:map_cleanup_done"
+            if await redis_client.set(cleanup_lock_key, "1", nx=True, ex=86400):
+                logger.info("Map phase complete. Actively tearing down Map pods to free capacity.")
+                # STEP 1: Teardown physical K8s Map pods FIRST (phase-scoped so Reduce queue is preserved)
+                await k8s_provider.delete_job(job_id, phase="map")
 
-            # STEP 2: Free up the global Map capacity from the semaphore safely
-            await CacheRepository.release_job_capacity(job_id, redis_client)
+                # STEP 2: Free up the global Map capacity from the semaphore safely
+                await CacheRepository.release_job_capacity(job_id, redis_client)
+            else:
+                logger.debug("Map phase cleanup already performed for job %s. Skipping duplicate teardown.", job_id)
 
             # --- Prevent Reduce Phase Capacity Hijack ---
             # Re-reserve capacity specifically for the Reduce phase
@@ -300,14 +351,19 @@ class TaskEventProcessor:
             )
 
             # If the cluster is too saturated to grant the required Reduce capacity,
-            # release any partial lock and yield the transition back to the queue.
+            # release any partial lock and delay before re-publishing to avoid a hot spin-loop.
             if granted_capacity < target_reducers:
                 logger.warning(
-                    "Capacity Starvation: Could not reserve %d slots for job %s. Requeueing event.",
+                    "Capacity Starvation: Could not reserve %d slots for job %s. Delaying transition retry.",
                     target_reducers, job_id
                 )
                 await CacheRepository.release_job_capacity(job_id, redis_client)
-                await message.reject(requeue=True)
+                await asyncio.sleep(2)
+                mq_channel = await get_rabbitmq_channel()
+                await mq_channel.default_exchange.publish(
+                    aio_pika.Message(body=job_id.encode('utf-8'), delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+                    routing_key="orchestration_events_queue"
+                )
                 return
             # -----------------------------------------------------
 
@@ -319,7 +375,8 @@ class TaskEventProcessor:
                 user_id=str(metadata['user_id']),
                 reducer_filename=metadata['reducer_filename'],
                 reducer_class=derived_reducer_class,
-                num_reducers=target_reducers
+                num_reducers=target_reducers,
+                file_format=metadata.get('format', 'TEXT')
             )
 
     @classmethod
@@ -376,7 +433,8 @@ class TaskEventProcessor:
                     reducer_filename=metadata['reducer_filename'],
                     reducer_class=derived_reducer_class,
                     num_reducers=metadata['num_reducers'],
-                    target_partition_id=int(reducer_id)
+                    target_partition_id=int(reducer_id),
+                    file_format=metadata.get('format', 'TEXT')
                 )
             return
 
@@ -408,7 +466,8 @@ class TaskEventProcessor:
             reducer_filename: str,
             reducer_class: str,
             num_reducers: int,
-            target_partition_id: Optional[int] = None
+            target_partition_id: Optional[int] = None,
+            file_format: str = "TEXT"
     ) -> None:
         """
         Orchestrates the deployment of Reducer workers with Data Locality logic.
@@ -485,6 +544,7 @@ class TaskEventProcessor:
                     job_id=job_id,
                     job_token=secure_job_token,
                     task_type=TaskType.REDUCE,
+                    format=file_format,
                     bucket_name="results",                     # Multi-Tenant isolation
                     object_name=f"{user_id}/{job_id}/",        # Output sandboxed per job
                     byte_offset=0,

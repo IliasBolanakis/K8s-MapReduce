@@ -89,6 +89,10 @@ class TaskMessage(BaseModel):
         description="Secure cryptographic token used by the Worker to authorize gRPC shuffle transfers."
     )
     task_type: TaskType = Field(description="Routing hint for the worker (MAP or REDUCE).")
+    format: str = Field(
+        default="TEXT",
+        description="The data serialization format of the input file (e.g., 'JSON', 'TEXT', 'AVRO')."
+    )
 
     # Infrastructure target metadata
     bucket_name: str = Field(description="S3 bucket containing the raw data (e.g., 'data' or 'results').")

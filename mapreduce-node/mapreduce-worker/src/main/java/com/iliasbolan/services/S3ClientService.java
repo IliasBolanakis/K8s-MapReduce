@@ -20,6 +20,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * High-performance I/O service for distributed storage orchestration.
@@ -95,19 +96,26 @@ public class S3ClientService {
      */
     public void downloadUserCode(String bucketName, String objectName, String destinationPath) throws Throwable {
         Retry.decorateCheckedRunnable(retryContext, () -> {
-            Path targetPath = Paths.get(destinationPath);
+            Path targetPath = Paths.get(destinationPath).toAbsolutePath();
             logger.info("Downloading user code from s3://{}/{} to local path: {}", bucketName, objectName, destinationPath);
 
-            Files.createDirectories(targetPath.getParent());
+            Path parentDir = targetPath.getParent();
+            if (parentDir != null) {
+                Files.createDirectories(parentDir);
+            }
 
+            Path tempPath = targetPath.resolveSibling(targetPath.getFileName() + "." + UUID.randomUUID() + ".tmp");
             try (InputStream stream = minioClient.getObject(
                     GetObjectArgs.builder()
                             .bucket(bucketName)
                             .object(objectName)
                             .build())) {
 
-                Files.copy(stream, targetPath, StandardCopyOption.REPLACE_EXISTING);
-                logger.info("Successfully downloaded user code to: {}", targetPath.toAbsolutePath());
+                Files.copy(stream, tempPath, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(tempPath, targetPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                logger.info("Successfully downloaded user code to: {}", targetPath);
+            } finally {
+                Files.deleteIfExists(tempPath);
             }
         }).run();
     }

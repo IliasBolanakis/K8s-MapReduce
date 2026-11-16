@@ -211,37 +211,16 @@ public class RabbitMqConsumer {
                 channel.basicAck(deliveryTag, false);
 
             } catch (Throwable t) {
-                logger.error("Transient task failure. Republishing with incremented retry count.", t);
+                logger.error("Task execution failed. Signaling Manager and NACKing delivery without local republish.", t);
 
                 try {
-                    // Isolate the network call so a secondary failure doesn't hijack the retry logic
+                    // Isolate the network call so a secondary failure doesn't prevent the NACK
                     eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", t.getClass().getSimpleName());
                 } catch (Exception networkError) {
-                    logger.error("Failed to broadcast error signal. Proceeding with local requeue.", networkError);
+                    logger.error("Failed to broadcast error signal. Proceeding with NACK.", networkError);
                 } finally {
-                    // --- Republish-with-Header Pattern ---
-                    // 1. Create a mutable copy of the headers and increment the custom retry count
-                    java.util.Map<String, Object> headers = delivery.getProperties().getHeaders();
-                    if (headers == null) {
-                        headers = new java.util.HashMap<>();
-                    } else {
-                        headers = new java.util.HashMap<>(headers); // Ensure mutability
-                    }
-                    headers.put("x-custom-retry-count", deliveryCount + 1);
-
-                    AMQP.BasicProperties retryProps = new AMQP.BasicProperties.Builder()
-                            .headers(headers)
-                            .deliveryMode(2) // Ensure the retry message is persistent on disk
-                            .contentType(delivery.getProperties().getContentType())
-                            .build();
-
-                    // 2. Publish the new message to the back of the queue
-                    // Note: "" as exchange routes it directly to the queueName
-                    channel.basicPublish("", this.queueName, retryProps, rawBody);
-
-                    // 3. ACK the original failing message so it is successfully dequeued
-                    channel.basicAck(deliveryTag, false);
-                    // ------------------------------------------
+                    // Manager owns task retries and lineage recovery; drop from worker queue via DLX NACK.
+                    channel.basicNack(deliveryTag, false, false);
                 }
             }
         } finally {

@@ -1,75 +1,57 @@
 <#
 .SYNOPSIS
-    MapReduce Framework - Deep Purge & Cluster Reset
+    MapReduce Framework - Deep Purge & Cluster Reset (Minikube K8s)
 .DESCRIPTION
-    Executes a hard wipe of the distributed system's state.
-    Destroys active Kubernetes compute resources, flushes all RabbitMQ
-    message queues (including the DLQ), wipes the Redis idempotency/capacity
-    cache, and optionally truncates the Postgres job history.
+    Executes a hard wipe of the distributed system's state inside Minikube:
+    destroys active Kubernetes worker Jobs/Pods, flushes RabbitMQ queues,
+    wipes Redis cache, and truncates the Postgres jobs table.
 #>
 
-# =============================================================================
-# 1. CONFIGURATION
-# =============================================================================
-$K8S_NAMESPACE      = "default"
-
-# Docker Containers
-$RABBIT_CONTAINER   = "local-rabbitmq"
-$REDIS_CONTAINER    = "local-redis"
-$POSTGRES_CONTAINER = "local-postgres"
+$ErrorActionPreference = "Continue"
+$K8S_NAMESPACE = "default"
 
 Write-Host "===============================================================================" -ForegroundColor Cyan
-Write-Host " INITIATING DEEP PURGE SEQUENCE" -ForegroundColor Cyan
+Write-Host " INITIATING DEEP PURGE SEQUENCE (K8s Minikube)" -ForegroundColor Cyan
 Write-Host "===============================================================================" -ForegroundColor Cyan
 
 # =============================================================================
-# 2. KUBERNETES CLEANUP (Forced Teardown)
+# 1. KUBERNETES CLEANUP
 # =============================================================================
-Write-Host "`n[INFO] Phase 1: Destroying Kubernetes Resources..." -ForegroundColor Cyan
-
-Write-Host "  -> Deleting all Job definitions (Map and Reduce phases)..." -ForegroundColor DarkGray
+Write-Host "`n[INFO] Phase 1: Destroying Kubernetes Worker Jobs & Pods..." -ForegroundColor Cyan
 kubectl delete jobs --all --namespace $K8S_NAMESPACE --wait=false 2>$null
-
-Write-Host "  -> Force-terminating worker Pods immediately..." -ForegroundColor DarkGray
 kubectl delete pods -l app=worker-node --namespace $K8S_NAMESPACE --force --grace-period=0 2>$null
-
-Write-Host "[SUCCESS] K8s cluster wiped." -ForegroundColor Green
+Write-Host "[SUCCESS] K8s worker jobs/pods wiped." -ForegroundColor Green
 
 # =============================================================================
-# 3. RABBITMQ MESSAGE FLUSH
+# 2. RABBITMQ MESSAGE FLUSH
 # =============================================================================
 Write-Host "`n[INFO] Phase 2: Purging RabbitMQ Queues..." -ForegroundColor Cyan
-
-Write-Host "  -> Clearing primary operational queues..." -ForegroundColor DarkGray
-docker exec $RABBIT_CONTAINER rabbitmqctl purge_queue map_tasks_queue 2>$null
-docker exec $RABBIT_CONTAINER rabbitmqctl purge_queue reduce_tasks_queue 2>$null
-docker exec $RABBIT_CONTAINER rabbitmqctl purge_queue job_events_queue 2>$null
-docker exec $RABBIT_CONTAINER rabbitmqctl purge_queue orchestration_events_queue 2>$null
-
-Write-Host "  -> Clearing Dead Letter Queue (DLQ)..." -ForegroundColor DarkGray
-docker exec $RABBIT_CONTAINER rabbitmqctl purge_queue dlq_tasks 2>$null
-
-Write-Host "[SUCCESS] Event queues flushed." -ForegroundColor Green
+$rmqPod = (kubectl get pods -n $K8S_NAMESPACE -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}' 2>$null).Trim()
+if ($rmqPod) {
+    foreach ($q in @("job_events_queue", "orchestration_events_queue", "dead_letter_queue")) {
+        kubectl exec -n $K8S_NAMESPACE $rmqPod -- rabbitmqctl purge_queue $q 2>$null | Out-Null
+    }
+}
+Write-Host "[SUCCESS] RabbitMQ event queues flushed." -ForegroundColor Green
 
 # =============================================================================
-# 4. REDIS STATE WIPE
+# 3. REDIS STATE WIPE
 # =============================================================================
 Write-Host "`n[INFO] Phase 3: Wiping Redis State Memory..." -ForegroundColor Cyan
-
-Write-Host "  -> Flushing in-memory cache to destroy active job tracking states..." -ForegroundColor DarkGray
-docker exec $REDIS_CONTAINER redis-cli FLUSHALL | Out-Null
-
+$redisPod = (kubectl get pods -n $K8S_NAMESPACE -l app=redis -o jsonpath='{.items[0].metadata.name}' 2>$null).Trim()
+if ($redisPod) {
+    kubectl exec -n $K8S_NAMESPACE $redisPod -- redis-cli FLUSHALL | Out-Null
+}
 Write-Host "[SUCCESS] Redis state wiped." -ForegroundColor Green
 
 # =============================================================================
-# 5. POSTGRES DATABASE RESET (Optional/Soft)
+# 4. POSTGRES DATABASE RESET
 # =============================================================================
 Write-Host "`n[INFO] Phase 4: Truncating Job History in Postgres..." -ForegroundColor Cyan
-
-# Note: If you want to keep history during purges, comment out the line below.
-Write-Host "  -> Deleting historical records..." -ForegroundColor DarkGray
-docker exec $POSTGRES_CONTAINER psql -U postgres -d dds_db -c "DELETE FROM jobs;" | Out-Null
-
+$pgPod = (kubectl get pods -n $K8S_NAMESPACE -l app=postgres -o jsonpath='{.items[0].metadata.name}' 2>$null).Trim()
+if ($pgPod) {
+    kubectl exec -n $K8S_NAMESPACE $pgPod -- psql -U postgres -d dds_db -c "DELETE FROM public.jobs;" | Out-Null
+}
 Write-Host "[SUCCESS] Job history truncated." -ForegroundColor Green
 
 Write-Host "`n===============================================================================" -ForegroundColor Cyan
