@@ -14,9 +14,10 @@ from redis.asyncio import Redis
 from app.k8s.client import KubernetesProvider
 from app.repositories.cache_repository import CacheRepository
 from app.repositories.job_repository import JobRepository
-from app.core.logger import job_id_var
+from app.core.logger import job_id_var, task_id_var, attempt_id_var
 
 logger = logging.getLogger(__name__)
+
 
 async def forcefully_reclaim_job(
     job_id: str,
@@ -28,7 +29,8 @@ async def forcefully_reclaim_job(
     Executes the isolated, idempotent cleanup pipeline for a MapReduce job.
 
     This function safely tears down physical compute resources, releases
-    multi-tenant mathematical capacity limits from the distributed cache,
+    multi-tenant mathematical capacity limits (including any ``reduce_waiting``
+    watermark) and ephemeral job metadata from the distributed cache,
     and persistently transitions the database state to 'FAILED'. It is designed
     to safely catch and log individual API errors to prevent disruption of
     bulk garbage collection sweeps.
@@ -44,19 +46,26 @@ async def forcefully_reclaim_job(
     :return: None
     :rtype: None
     """
-    job_id_var.set(job_id)
-    logger.warning(f"Initiating centralized resource reclamation for job {job_id}.")
+    job_tok = job_id_var.set(job_id)
+    task_tok = task_id_var.set("-")
+    attempt_tok = attempt_id_var.set(0)
+    logger.warning("Initiating centralized resource reclamation for job %s.", job_id)
 
     try:
-        # STEP 1: Reclaim physical compute resources FIRST (Idempotent)
+        # STEP 1: Reclaim physical compute resources & queues FIRST (Idempotent)
         await k8s_provider.delete_job(job_id)
 
-        # STEP 2: Recover allocated multi-tenant mathematical limits safely
+        # STEP 2: Recover allocated multi-tenant mathematical limits & ephemeral metadata
         await CacheRepository.release_job_capacity(job_id, redis_client)
+        await CacheRepository.cleanup_job_metadata(job_id, redis_client)
 
         # STEP 3: Mutate persistent state only AFTER successful reclamation
         await JobRepository.mark_job_failed(job_id, db_pool)
-        logger.info(f"Job {job_id} persistently transitioned to FAILED.")
+        logger.info("Job %s persistently transitioned to FAILED.", job_id)
 
     except Exception as cleanup_err:
-        logger.error(f"Failed to fully reclaim job {job_id}: {str(cleanup_err)}")
+        logger.error("Failed to fully reclaim job %s: %s", job_id, str(cleanup_err))
+    finally:
+        attempt_id_var.reset(attempt_tok)
+        task_id_var.reset(task_tok)
+        job_id_var.reset(job_tok)

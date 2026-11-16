@@ -29,9 +29,10 @@ import java.util.List;
  * @param combinerClassName  The optional fully qualified name of the user's Combiner class.
  * @param workerEndpoints    A routing table of network addresses (IP:Port) for active physical ESS nodes.
  * @param format             The input data format (e.g., <code>"TEXT"</code>).
+ * @param attemptId          Monotonic attempt identifier issued by the Manager for zombie/stale-attempt fencing.
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 2.2
  * @since 2026-04-25
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -51,5 +52,49 @@ public record TaskPayload(
         String combinerCodeObject,
         String combinerClassName,
         List<String> workerEndpoints,
-        String format
-) {}
+        String format,
+        int attemptId
+) {
+    /**
+     * Backward-compatible 16-argument constructor defaulting {@code attemptId} to {@code 0}.
+     *
+     * @param jobId              The unique identifier of the overarching Map-Reduce job.
+     * @param taskId             The unique identifier for this specific chunk/partition.
+     * @param jobToken           The secure cryptographic token authorizing ESS Data Plane access.
+     * @param taskType           The operational phase to execute ({@code "MAP"} or {@code "REDUCE"}).
+     * @param bucketName         The MinIO bucket where the input data resides.
+     * @param objectName         The exact S3 object key for the input data.
+     * @param byteOffset         For MAP tasks: starting byte position.
+     * @param byteLength         For MAP tasks: number of bytes to read.
+     * @param numReducers        Total number of reducers (R) configured for the job.
+     * @param userCodeBucket     MinIO bucket containing user bytecode.
+     * @param userCodeObject     MinIO object key for user Mapper/Reducer bytecode.
+     * @param className          Fully qualified Mapper or Reducer class name.
+     * @param combinerCodeObject Optional MinIO object key for Combiner bytecode.
+     * @param combinerClassName  Optional fully qualified Combiner class name.
+     * @param workerEndpoints    Routing table of active ESS endpoints.
+     * @param format             Input data format (e.g., {@code "TEXT"}).
+     */
+    public TaskPayload(
+            String jobId,
+            String taskId,
+            String jobToken,
+            String taskType,
+            String bucketName,
+            String objectName,
+            long byteOffset,
+            long byteLength,
+            int numReducers,
+            String userCodeBucket,
+            String userCodeObject,
+            String className,
+            String combinerCodeObject,
+            String combinerClassName,
+            List<String> workerEndpoints,
+            String format
+    ) {
+        this(jobId, taskId, jobToken, taskType, bucketName, objectName, byteOffset, byteLength,
+                numReducers, userCodeBucket, userCodeObject, className, combinerCodeObject,
+                combinerClassName, workerEndpoints, format, 0);
+    }
+}

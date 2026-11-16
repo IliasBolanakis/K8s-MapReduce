@@ -1,158 +1,191 @@
 package com.iliasbolan;
 
 import com.iliasbolan.engine.TaskExecutor;
+import com.iliasbolan.infrastructure.MinioConnectionManager;
 import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
 import com.iliasbolan.services.RabbitMqConsumer;
 import com.iliasbolan.services.RabbitMqProducer;
-import com.iliasbolan.infrastructure.MinioConnectionManager;
 import com.iliasbolan.services.S3ClientService;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * The primary entry point for the distributed Map-Reduce Worker node.
+ * Primary entry point for the distributed Map-Reduce Worker node.
  * <p>
- * This class orchestrates the bootstrap sequence of a stateless compute worker, ensuring all
- * infrastructure dependencies are resolved before entering the task consumption loop.
- * Key responsibilities include:
- * </p>
- * <ul>
- * <li><b>Configuration Management:</b> Resolving environment-based parameters for cloud-native deployment.</li>
- * <li><b>Resource Wiring:</b> Initializing connection managers for RabbitMQ and S3-compatible storage (MinIO).</li>
- * <li><b>Computational Steering:</b> Wiring the execution engine for Map and Reduce phases.</li>
- * <li><b>Observability:</b> Exposing a lightweight HTTP health probe for Kubernetes liveness and readiness checks.</li>
- * <li><b>Lifecycle Management:</b> Implementing graceful shutdown hooks to handle pod eviction and signal termination.</li>
- * </ul>
- * * <h3>Architecture Context: ESS Integration</h3>
- * <p>
- * In alignment with the <b>Version 2.0</b> specification, this worker operates in a sidecar-dependent
- * mode where gRPC Shuffle Server responsibilities are delegated to the <b>External Shuffle Service (ESS)</b>
- * DaemonSet. This architecture ensures compute nodes remain entirely ephemeral and stateless.
+ * Bootstraps RabbitMQ/MinIO clients, resolves deterministic queue bindings (including
+ * K8s {@code Indexed} Reduce {@code JOB_COMPLETION_INDEX} and targeted {@code PARTITION_ID}
+ * overrides), exposes the Kubernetes {@code /health} probe, and orchestrates ordered
+ * {@code SIGTERM} graceful draining.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 3.0
  * @since 2026-04-25
  */
 public class App {
 
-    /**
-     * Standard SLF4J logger for bootstrap and lifecycle events.
-     */
     private static final Logger logger = LoggerFactory.getLogger(App.class);
 
     /**
-     * Application execution entry point. Performs dependency injection and starts the
-     * blocking event-driven consumer loop.
+     * Resolved AMQP queue configuration derived from Kubernetes worker environment variables.
      *
-     * @param args Command line arguments (Configuration is derived from Environment Variables).
+     * @param taskQueue           Target RabbitMQ queue name.
+     * @param singlePartitionMode {@code true} when bound to a single Reduce partition index.
+     */
+    record QueueConfig(String taskQueue, boolean singlePartitionMode) {}
+
+    /**
+     * Application execution entry point.
+     *
+     * @param args Command line arguments (configuration is derived from environment variables).
      */
     public static void main(String[] args) {
         logger.info("====== [ Map-Reduce Ephemeral Compute Worker Initializing ] ======");
 
-        // 1. Environment-Based Configuration
-        // Control Plane (RabbitMQ) parameters for managing task distribution and signaling.
-        String rabbitHost = System.getenv().getOrDefault("RABBITMQ_HOST", "localhost");
-        String rabbitUser = System.getenv().getOrDefault("RABBITMQ_USER", "guest");
-        String rabbitPass = System.getenv().getOrDefault("RABBITMQ_PASS", "guest");
+        Map<String, String> env = System.getenv();
+        String rabbitHost = env.getOrDefault("RABBITMQ_HOST", "localhost");
+        String rabbitUser = env.getOrDefault("RABBITMQ_USER", "guest");
+        String rabbitPass = env.getOrDefault("RABBITMQ_PASS", "guest");
 
-        // DYNAMIC QUEUE RESOLUTION
-        // Construct the isolated queue name using the injected Kubernetes environment variables.
-        String jobId = System.getenv("JOB_ID");
-        String phase = System.getenv().getOrDefault("PHASE", "map").toLowerCase();
-        String taskQueue;
-
-        if (jobId != null && !jobId.trim().isEmpty()) {
-            taskQueue = phase + "_tasks_" + jobId;
-        } else {
-            // Fallback to legacy queue for local offline development
-            taskQueue = System.getenv().getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
+        QueueConfig queueConfig = resolveQueueConfig(env);
+        String taskQueue = queueConfig.taskQueue();
+        boolean singlePartitionMode = queueConfig.singlePartitionMode();
+        if (env.get("JOB_ID") == null || env.get("JOB_ID").trim().isEmpty()) {
             logger.warn("JOB_ID not found in environment. Falling back to default queue: {}", taskQueue);
         }
-        // --------------------------------------------------
 
-        String eventQueue = System.getenv().getOrDefault("EVENT_QUEUE", "job_events_queue");
-        int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "5000"));
+        String eventQueue = env.getOrDefault("EVENT_QUEUE", "job_events_queue");
+        int idleTimeout = Integer.parseInt(env.getOrDefault("IDLE_TIMEOUT_MILLIS", "5000"));
 
-        // Storage Plane (MinIO/S3) parameters for user-code and dataset retrieval.
-        String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
-        String minioUser = System.getenv().getOrDefault("MINIO_ROOT_USER", "minioadmin");
-        String minioPass = System.getenv().getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
+        String minioEndpoint = env.getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
+        String minioUser = env.getOrDefault("MINIO_ROOT_USER", "minioadmin");
+        String minioPass = env.getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
 
-        // Data Plane (Local Disk for ESS Handoff)
-        // This directory serves as the handoff point between the compute pod and the host ESS.
-        String baseShuffleDir = System.getenv().getOrDefault("SHUFFLE_DIR", "/mnt/mapreduce-shuffle");
+        String baseShuffleDir = env.getOrDefault("SHUFFLE_DIR", "/mnt/mapreduce-shuffle");
+        String nodeIp = env.getOrDefault("NODE_IP", "127.0.0.1");
 
-        // VITAL: Node IP extracted via K8s Downward API for ESS routing and Data Locality scheduling.
-        String nodeIp = System.getenv().getOrDefault("NODE_IP", "127.0.0.1");
+        AtomicBoolean shuttingDown = new AtomicBoolean(false);
+        AtomicBoolean completedNormally = new AtomicBoolean(false);
 
         try {
-            // 2. Initialize Core Infrastructure Managers
-            // These managers maintain stateful pools to RabbitMQ and S3 (MinIO).
             RabbitMqConnectionManager rabbitManager = new RabbitMqConnectionManager(rabbitHost, rabbitUser, rabbitPass);
             MinioConnectionManager minioManager = new MinioConnectionManager(minioEndpoint, minioUser, minioPass);
             S3ClientService s3ClientService = new S3ClientService(minioManager);
 
-            // 3. Initialize Messaging Components
-            // The Producer acts as the feedback loop signaling task transitions back to the Manager.
             RabbitMqProducer eventProducer = new RabbitMqProducer(rabbitManager, eventQueue);
-
-            // 4. Initialize the Computational Engine
-            // TaskExecutor encapsulates the logic for sandbox isolation and cross-node shuffle fetches.
             TaskExecutor taskExecutor = new TaskExecutor(s3ClientService, baseShuffleDir, eventProducer, nodeIp);
+            RabbitMqConsumer consumer = new RabbitMqConsumer(
+                    rabbitManager, taskQueue, idleTimeout, taskExecutor, eventProducer, singlePartitionMode);
 
-            // 5. Initialize the Consumer
-            // RabbitMqConsumer implements the competing consumers pattern to drain the task queue.
-            RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitManager, taskQueue, idleTimeout, taskExecutor, eventProducer);
-
-            /* --------------------------------------------------- */
-            /* --- HTTP SERVER (CONTROL PLANE: K8S PROBES)     --- */
-            /* --------------------------------------------------- */
-            // Exposes port 8080 to satisfy Kubernetes Readiness and Liveness probes.
             HttpServer healthServer = HttpServer.create(new InetSocketAddress(8080), 0);
-            healthServer.createContext("/health", exchange -> {
-                String response = "OK";
-                exchange.sendResponseHeaders(200, response.length());
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response.getBytes());
-                }
-            });
-            healthServer.setExecutor(null); // Use the default executor
+            healthServer.createContext("/health", createHealthHandler(shuttingDown));
+            healthServer.setExecutor(null);
             healthServer.start();
             logger.info("Health probe server active on port 8080 [/health]");
 
-            // --- GRACEFUL SHUTDOWN LOGIC ---
-            // Ensures that AMQP channels are closed and in-flight tasks are handled before pod termination.
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                logger.warn(">>> Shutdown signal received. Cleaning up worker resources... <<<");
+                if (completedNormally.get()) {
+                    return;
+                }
+                logger.warn(">>> Shutdown signal received. Flipping /health to 503 and initiating graceful drain... <<<");
+                shuttingDown.set(true);
                 try {
-                    healthServer.stop(0);
-                    consumer.stopConsuming();
-                    Thread.sleep(1000); // Wait for the network stack to flush pending ACKs
+                    consumer.initiateGracefulDrain();
                 } catch (Exception e) {
-                    logger.error("Error during graceful shutdown: {}", e.getMessage());
+                    logger.error("Error during graceful shutdown: {}", e.getMessage(), e);
+                } finally {
+                    eventProducer.close();
+                    taskExecutor.close();
+                    healthServer.stop(0);
                 }
                 logger.info("Worker shutdown complete.");
-            }));
+            }, "worker-sigterm-drain"));
 
-            // 6. Enter Main Execution Loop
-            // Blocking call: the worker will stay in this loop until the queue is drained or interrupted.
-            logger.info("Entering event-driven task loop for queue: {}", taskQueue);
+            logger.info("Entering event-driven task loop for queue: {} (singlePartitionMode={})",
+                    taskQueue, singlePartitionMode);
             consumer.startConsuming();
 
-            // 7. Cleanup and Exit
-            logger.info("Task queue drained. Shutting down worker.");
+            completedNormally.set(true);
+            shuttingDown.set(true);
+            logger.info("Task consumption finished. Closing worker resources.");
+            taskExecutor.close();
+            eventProducer.close();
             healthServer.stop(0);
             System.exit(0);
 
         } catch (Throwable e) {
-            // Fatal errors during initialization trigger a non-zero exit code to alert K8s.
             logger.error("Fatal initialization error. Worker process terminating.", e);
             System.exit(1);
         }
+    }
+
+    /**
+     * Resolves the target RabbitMQ task queue and consumer mode from environment variables.
+     * <p>
+     * For {@code PHASE=reduce} with a non-blank {@code JOB_ID}, checks {@code PARTITION_ID} first
+     * (targeted single-partition recovery), then {@code JOB_COMPLETION_INDEX} (Kubernetes
+     * {@code Indexed} Job). When either index is present, binds to
+     * {@code reduce_tasks_<jobId>_<idx>} with {@code singlePartitionMode=true}. Otherwise falls
+     * back to {@code <phase>_tasks_<jobId>} or {@code RABBITMQ_QUEUE} when {@code JOB_ID} is unset.
+     * </p>
+     *
+     * @param env Environment variable map.
+     * @return Resolved {@link QueueConfig}.
+     */
+    static QueueConfig resolveQueueConfig(Map<String, String> env) {
+        String jobId = env.get("JOB_ID");
+        String phase = env.getOrDefault("PHASE", "map").trim().toLowerCase();
+
+        if (jobId != null && !jobId.trim().isEmpty()) {
+            String cleanJobId = jobId.trim();
+            if ("reduce".equalsIgnoreCase(phase)) {
+                String idx = firstNonBlank(env.get("PARTITION_ID"), env.get("JOB_COMPLETION_INDEX"));
+                if (idx != null) {
+                    return new QueueConfig("reduce_tasks_" + cleanJobId + "_" + idx, true);
+                }
+                return new QueueConfig("reduce_tasks_" + cleanJobId, false);
+            }
+            return new QueueConfig(phase + "_tasks_" + cleanJobId, false);
+        }
+
+        String fallbackQueue = env.getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
+        return new QueueConfig(fallbackQueue, false);
+    }
+
+    /**
+     * Creates the {@code /health} HTTP handler returning {@code 200 OK} during normal operation
+     * and {@code 503 Service Unavailable} once {@code shuttingDown} flips to {@code true}.
+     *
+     * @param shuttingDown Atomic drain flag toggled immediately upon {@code SIGTERM}.
+     * @return Configured {@link HttpHandler}.
+     */
+    static HttpHandler createHealthHandler(AtomicBoolean shuttingDown) {
+        return exchange -> {
+            boolean draining = shuttingDown.get();
+            int statusCode = draining ? 503 : 200;
+            byte[] responseBytes = (draining ? "UNAVAILABLE" : "OK").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(statusCode, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        };
+    }
+
+    private static String firstNonBlank(String primary, String secondary) {
+        if (primary != null && !primary.trim().isEmpty()) {
+            return primary.trim();
+        }
+        if (secondary != null && !secondary.trim().isEmpty()) {
+            return secondary.trim();
+        }
+        return null;
     }
 }

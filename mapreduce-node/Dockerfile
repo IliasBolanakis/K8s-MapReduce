@@ -40,4 +40,4 @@ ENV MINIO_ROOT_USER="minioadmin"
 ENV MINIO_ROOT_PASSWORD="minioadmin"
 
 # Start the Worker Engine using the Uber-JAR
-CMD ["java", "-XX:InitialRAMPercentage=10.0", "-XX:MaxRAMPercentage=15.0", "-jar", "app.jar"]
+CMD ["java", "-XX:InitialRAMPercentage=10.0", "-XX:MaxRAMPercentage=15.0", "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1", "-jar", "app.jar"]

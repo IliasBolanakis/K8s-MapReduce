@@ -123,6 +123,10 @@ class TaskMessage(BaseModel):
         default_factory=list,
         description="List of address@@IP:Port endpoints for worker-to-worker data transfers."
     )
+    attempt_id: int = Field(
+        default=0,
+        description="Monotonic fencing attempt identifier minted by the Manager for stale-zombie prevention."
+    )
 
 
 class WorkerSignal(BaseModel):
@@ -161,6 +165,11 @@ class WorkerSignal(BaseModel):
         default=None,
         alias="workerBindAddress",
         description="The network address (node@@IP:Port) where the ESS is serving partitioned data."
+    )
+    attempt_id: int = Field(
+        default=0,
+        alias="attemptId",
+        description="Monotonic fencing attempt identifier echoed by the worker to detect stale zombies."
     )
 
 

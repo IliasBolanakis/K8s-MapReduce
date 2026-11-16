@@ -1,91 +1,54 @@
 """
 Unit tests for the Kubernetes infrastructure orchestration client.
 
-This suite provides comprehensive validation for the lifecycle management of worker
-pods via the Kubernetes Batch V1 API. It ensures that the Jinja2 template engine
-correctly hydrates manifests, node selectors are applied securely, and the
-asynchronous barrier logic handles job completion deterministically.
-
-These tests verify the Data Locality Scheduling requirements, ensuring Reducer
-pods are correctly pinned to physical hostnames and that the physical identity
-(NODE_IP and NODE_NAME) is propagated via the template's Downward API configurations.
+Validates:
+    - ADR-04: Indexed Reduce Batch Jobs (`completionMode: Indexed`,
+      `backoffLimitPerIndex: 3`, no top-level `backoffLimit`, `restartPolicy: Never`,
+      `terminationGracePeriodSeconds: 40`) vs Map / targeted single-partition recovery
+      (`backoffLimit: 4`, `restartPolicy: OnFailure`, `PARTITION_ID`, `RABBITMQ_QUEUE`),
+      and per-partition queue deletion (`reduce_tasks_{job_id}_{p_id}`).
+    - ADR-11: Lifecycle-managed pooled `ApiClient`, async `Watch` completion
+      monitoring with `410 Gone` relist handling, and single-call batched
+      `get_active_pod_counts_by_job`.
 """
 
-from typing import Any, Dict
-from unittest.mock import MagicMock, AsyncMock
+from pathlib import Path
+from typing import Any, Dict, List
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from app.k8s.client import MockKubernetesProvider, RealKubernetesProvider
+from kubernetes_asyncio.client.exceptions import ApiException
 
+from app.k8s import client as k8s_client_module
+from app.k8s.client import (
+    MockKubernetesProvider,
+    RealKubernetesProvider,
+    get_active_pod_counts_by_job,
+    teardown_k8s,
+)
 
-# --- FIXTURES ---
 
 @pytest.fixture
 def mock_settings(mocker: Any) -> None:
-    """
-    Mocks global infrastructure settings to ensure predictable test conditions.
-
-    :param mocker: The pytest-mock fixture.
-    """
+    """Mocks global infrastructure settings for predictable test conditions."""
     mocker.patch("app.k8s.client.settings.MAX_TOTAL_WORKERS", 5)
     mocker.patch("app.k8s.client.settings.K8S_NAMESPACE", "test-namespace")
+    mocker.patch("app.k8s.client.settings.GLOBAL_JOB_TIMEOUT", 60)
 
 
 @pytest.fixture
-def dummy_worker_template() -> str:
-    """
-    Provides a minimal valid Jinja2 template for testing manifest rendering.
-
-    Includes a conditional nodeSelector to support Data Locality tests, and
-    simulates the presence of Downward API configurations.
-
-    :return: A string representation of a Kubernetes Job YAML template.
-    """
-    return """
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: {{ JOB_NAME }}
-spec:
-  completions: {{ REPLICAS }}
-  template:
-    spec:
-      {% if TARGET_NODE %}
-      nodeSelector:
-        kubernetes.io/hostname: "{{ TARGET_NODE }}"
-      {% endif %}
-      containers:
-      - name: worker
-        env:
-        - name: EXISTING_VAR
-          value: "keep_me"
-        - name: IDLE_TIMEOUT_MILLIS
-          value: "30000"
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.hostIP
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-"""
+def real_worker_template() -> str:
+    """Loads the actual worker-template.yaml so Jinja2/K8s schema rules are verified directly."""
+    template_path = Path(__file__).resolve().parents[3] / "app" / "k8s" / "templates" / "worker-template.yaml"
+    return template_path.read_text(encoding="utf-8")
 
 
 @pytest.fixture
-def mock_k8s_api(mocker: Any) -> Dict[str, MagicMock]:
-    """
-    Standardizes the mocking of the Kubernetes ApiClient and BatchV1Api.
-
-    Ensures 'deserialize' is synchronous to avoid coroutine subscription errors
-    common in async Kubernetes clients.
-
-    :param mocker: The pytest-mock fixture.
-    :return: A dictionary of mocked API components.
-    """
+def mock_k8s_api(mocker: Any) -> Dict[str, Any]:
+    """Standardizes mocking of the pooled ApiClient, BatchV1Api, and CoreV1Api."""
     mock_api_client_cls = mocker.patch("app.k8s.client.client.ApiClient")
     api_instance = mock_api_client_cls.return_value
-
+    api_instance.close = AsyncMock()
     api_instance.__aenter__ = AsyncMock(return_value=api_instance)
     api_instance.__aexit__ = AsyncMock(return_value=None)
     api_instance.deserialize = MagicMock(side_effect=lambda _model, data, _type: data)
@@ -98,156 +61,233 @@ def mock_k8s_api(mocker: Any) -> Dict[str, MagicMock]:
     mock_delete_job = AsyncMock()
     mock_batch_cls.return_value.delete_namespaced_job = mock_delete_job
 
+    mock_core_cls = mocker.patch("app.k8s.client.client.CoreV1Api")
+    mock_list_pods = AsyncMock()
+    mock_core_cls.return_value.list_namespaced_pod = mock_list_pods
+
     return {
+        "api_client_cls": mock_api_client_cls,
         "api_instance": api_instance,
         "create_job": mock_create_job,
         "list_jobs": mock_list_jobs,
         "delete_job": mock_delete_job,
+        "list_pods": mock_list_pods,
     }
 
 
-# --- TESTS ---
-
 @pytest.mark.asyncio
 async def test_mock_provider_execution() -> None:
-    """
-    Verifies the operational safety and API parity of the MockKubernetesProvider.
-    """
+    """Verifies operational safety and API parity of MockKubernetesProvider."""
     provider = MockKubernetesProvider()
-    await provider.spawn_workers("job-123", 10)
+    await provider.spawn_workers("job-123", 10, phase="reduce", indexed=True)
     await provider.wait_for_job_completion("job-123")
-    await provider.delete_job("job-123")
+    await provider.delete_job("job-123", num_reducers=4)
 
 
 @pytest.mark.asyncio
-async def test_spawn_workers_renders_and_submits(
+async def test_spawn_workers_map_renders_real_template_and_reuses_api_client(
     mocker: Any,
     mock_settings: None,
     mock_k8s_api: Dict[str, Any],
-    dummy_worker_template: str
+    real_worker_template: str,
 ) -> None:
-    """
-    Validates the 'Map' phase manifest generation and API submission sequence.
-
-    Verifies that environment variables defined in the template (such as
-    NODE_IP and NODE_NAME) are correctly preserved and sent to the K8s API.
-    """
+    """Validates Map Job manifest generation and pooled ApiClient reuse (ADR-04, ADR-11)."""
     mock_file = AsyncMock()
-    mock_file.read.return_value = dummy_worker_template
+    mock_file.read.return_value = real_worker_template
     mock_open = mocker.patch("app.k8s.client.aiofiles.open")
     mock_open.return_value.__aenter__.return_value = mock_file
 
     provider = RealKubernetesProvider()
     await provider.spawn_workers(job_id="test-job-uuid", replicas=10, phase="map")
+    await provider.spawn_workers(job_id="test-job-uuid-2", replicas=2, phase="map")
 
-    create_job_mock = mock_k8s_api["create_job"]
-    create_job_mock.assert_called_once()
+    # Pooled ApiClient initialized only once across multiple calls
+    mock_k8s_api["api_client_cls"].assert_called_once()
+    assert mock_k8s_api["create_job"].call_count == 2
 
-    call_args = create_job_mock.call_args
-    assert call_args is not None
-    submitted_manifest: Dict[str, Any] = call_args.kwargs["body"]
+    submitted_manifest = mock_k8s_api["create_job"].call_args_list[0].kwargs["body"]
+    spec = submitted_manifest["spec"]
+    pod_spec = spec["template"]["spec"]
 
-    # Verify basic metadata and constraints
-    assert call_args.kwargs["namespace"] == "test-namespace"
-    assert "worker-map-test-job" in submitted_manifest["metadata"]["name"]
-    assert submitted_manifest["spec"]["completions"] == 5  # Capped by mock_settings
+    assert spec["parallelism"] == 5
+    assert spec["completions"] == 5
+    assert spec["backoffLimit"] == 4
+    assert "backoffLimitPerIndex" not in spec
+    assert "completionMode" not in spec
+    assert pod_spec["restartPolicy"] == "OnFailure"
+    assert pod_spec["terminationGracePeriodSeconds"] == 40
 
-    # Verify Environment Variables present in the template manifest
-    env_vars = submitted_manifest["spec"]["template"]["spec"]["containers"][0]["env"]
+    env_vars = pod_spec["containers"][0]["env"]
+    env_map = {e["name"]: e for e in env_vars}
+    assert "-XX:+TieredCompilation" in env_map["JAVA_OPTS"]["value"]
+    assert "-XX:TieredStopAtLevel=1" in env_map["JAVA_OPTS"]["value"]
+    assert env_map["RABBITMQ_QUEUE"]["value"] == "map_tasks_test-job-uuid"
+    assert "PARTITION_ID" not in env_map
+    assert env_map["NODE_IP"]["valueFrom"]["fieldRef"]["fieldPath"] == "status.hostIP"
+    assert env_map["NODE_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "spec.nodeName"
 
-    # Helper to retrieve an env var definition safely
-    def get_env(name: str) -> Dict[str, Any]:
-        return next((e for e in env_vars if e["name"] == name), {})
-
-    assert get_env("EXISTING_VAR") == {"name": "EXISTING_VAR", "value": "keep_me"}
-    assert get_env("IDLE_TIMEOUT_MILLIS") == {"name": "IDLE_TIMEOUT_MILLIS", "value": "30000"}
-
-    # VITAL: Verify Downward API Identity properties are preserved
-    node_ip_env = get_env("NODE_IP")
-    assert node_ip_env.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "status.hostIP"
-
-    node_name_env = get_env("NODE_NAME")
-    assert node_name_env.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") == "spec.nodeName"
+    await provider.close()
+    mock_k8s_api["api_instance"].close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_spawn_workers_with_data_locality(
+async def test_spawn_workers_indexed_reduce_k8s_spec_rules(
     mocker: Any,
     mock_settings: None,
     mock_k8s_api: Dict[str, Any],
-    dummy_worker_template: str
+    real_worker_template: str,
 ) -> None:
     """
-    Verifies that the provider applies targeted node affinity when a
-    physical host hint is provided by the Manager.
+    Verifies ADR-04 Indexed Reduce Job spec:
+    completionMode=Indexed, completions=num_reducers, parallelism=min(num_reducers, MAX_TOTAL_WORKERS),
+    backoffLimitPerIndex=3, NO top-level backoffLimit, restartPolicy=Never, terminationGracePeriodSeconds=40.
     """
     mock_file = AsyncMock()
-    mock_file.read.return_value = dummy_worker_template
+    mock_file.read.return_value = real_worker_template
     mocker.patch("app.k8s.client.aiofiles.open").return_value.__aenter__.return_value = mock_file
 
     provider = RealKubernetesProvider()
-    target_host = "physical-node-01"
+    await provider.spawn_workers(job_id="indexed-job-1", replicas=8, phase="reduce", indexed=True)
 
+    submitted_manifest = mock_k8s_api["create_job"].call_args.kwargs["body"]
+    spec = submitted_manifest["spec"]
+    pod_spec = spec["template"]["spec"]
+
+    assert spec["completionMode"] == "Indexed"
+    assert spec["completions"] == 8
+    assert spec["parallelism"] == 5  # Capped by mock_settings MAX_TOTAL_WORKERS=5
+    assert spec["backoffLimitPerIndex"] == 3
+    assert "backoffLimit" not in spec
+    assert pod_spec["restartPolicy"] == "Never"
+    assert pod_spec["terminationGracePeriodSeconds"] == 40
+
+
+@pytest.mark.asyncio
+async def test_spawn_workers_targeted_recovery_injects_partition_id_and_locality(
+    mocker: Any,
+    mock_settings: None,
+    mock_k8s_api: Dict[str, Any],
+    real_worker_template: str,
+) -> None:
+    """Verifies non-indexed targeted recovery injects PARTITION_ID, per-partition queue, and nodeAffinity."""
+    mock_file = AsyncMock()
+    mock_file.read.return_value = real_worker_template
+    mocker.patch("app.k8s.client.aiofiles.open").return_value.__aenter__.return_value = mock_file
+
+    provider = RealKubernetesProvider()
     await provider.spawn_workers(
         job_id="locality-test",
         replicas=1,
         phase="reduce",
-        target_node=target_host
+        partition_id=2,
+        target_node="physical-node-01",
+        indexed=False,
     )
 
-    call_args = mock_k8s_api["create_job"].call_args
-    submitted_manifest = call_args.kwargs["body"]
+    submitted_manifest = mock_k8s_api["create_job"].call_args.kwargs["body"]
+    spec = submitted_manifest["spec"]
+    pod_spec = spec["template"]["spec"]
 
-    # Assert the Reducer pod is explicitly pinned to the specific node
-    node_selector = submitted_manifest["spec"]["template"]["spec"]["nodeSelector"]
-    assert node_selector["kubernetes.io/hostname"] == target_host
+    assert spec["backoffLimit"] == 4
+    assert "backoffLimitPerIndex" not in spec
+    assert pod_spec["restartPolicy"] == "OnFailure"
+
+    pref_terms = pod_spec["affinity"]["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
+    assert pref_terms[0]["preference"]["matchExpressions"][0]["values"] == ["physical-node-01"]
+
+    env_map = {e["name"]: e.get("value") for e in pod_spec["containers"][0]["env"]}
+    assert env_map["PARTITION_ID"] == "2"
+    assert env_map["RABBITMQ_QUEUE"] == "reduce_tasks_locality-test_2"
 
 
 @pytest.mark.asyncio
-async def test_wait_for_job_completion_polling_logic(
+async def test_wait_for_job_completion_watch_and_410_relist(
     mocker: Any,
-    mock_k8s_api: Dict[str, Any]
+    mock_settings: None,
+    mock_k8s_api: Dict[str, Any],
 ) -> None:
     """
-    Tests the stateless polling barrier logic using the Kubernetes API.
+    Verifies ADR-11 async Watch completion monitoring:
+    1. Initial list captures resource_version.
+    2. Watch handles 410 Gone by resetting resource_version and relisting.
+    3. Subsequent Watch MODIFIED event completes when succeeded >= completions.
     """
-    mock_job_unfinished = MagicMock()
-    mock_job_unfinished.spec.completions = 3
-    mock_job_unfinished.status.succeeded = 1
+    job_running = MagicMock()
+    job_running.metadata.name = "worker-reduce-1"
+    job_running.metadata.resource_version = "100"
+    job_running.spec.completions = 2
+    job_running.status.succeeded = 1
+    job_running.status.conditions = []
 
-    mock_job_finished = MagicMock()
-    mock_job_finished.spec.completions = 3
-    mock_job_finished.status.succeeded = 3
+    job_done = MagicMock()
+    job_done.metadata.name = "worker-reduce-1"
+    job_done.metadata.resource_version = "105"
+    job_done.spec.completions = 2
+    job_done.status.succeeded = 2
+    job_done.status.conditions = []
 
-    mock_list_unfinished = MagicMock(items=[mock_job_unfinished])
-    mock_list_finished = MagicMock(items=[mock_job_finished])
+    list_resp_1 = MagicMock(items=[job_running])
+    list_resp_1.metadata.resource_version = "100"
+    list_resp_2 = MagicMock(items=[job_running])
+    list_resp_2.metadata.resource_version = "101"
+    mock_k8s_api["list_jobs"].side_effect = [list_resp_1, list_resp_2]
 
-    # Configure the list_jobs mock to simulate progressive completion
-    mock_k8s_api["list_jobs"].side_effect = [mock_list_unfinished, mock_list_finished]
+    class _FakeWatchStream:
+        def __init__(self, events: List[Any]) -> None:
+            self._events = list(events)
+            self.stopped = False
 
-    # Patch sleep to accelerate test execution
-    mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
+        async def __aenter__(self) -> "_FakeWatchStream":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def stream(self, _func: Any, **kwargs: Any) -> "_FakeWatchStream":
+            self.kwargs = kwargs
+            return self
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def __aiter__(self) -> "_FakeWatchStream":
+            return self
+
+        async def __anext__(self) -> Any:
+            if self.stopped or not self._events:
+                raise StopAsyncIteration
+            nxt = self._events.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+    w1 = _FakeWatchStream([ApiException(status=410, reason="Expired")])
+    w2 = _FakeWatchStream([{"type": "MODIFIED", "object": job_done}])
+    mocker.patch("app.k8s.client.watch.Watch", side_effect=[w1, w2])
 
     provider = RealKubernetesProvider()
-    await provider.wait_for_job_completion(job_id="poll-test")
+    await provider.wait_for_job_completion("job-watch-410")
 
     assert mock_k8s_api["list_jobs"].call_count == 2
+    assert w1.kwargs["resource_version"] == "100"
+    assert w2.kwargs["resource_version"] == "101"
+    assert w2.stopped is True
 
 
 @pytest.mark.asyncio
 async def test_delete_job_phase_scoped_map_preserves_reduce(
     mocker: Any,
     mock_settings: None,
-    mock_k8s_api: Dict[str, Any]
+    mock_k8s_api: Dict[str, Any],
 ) -> None:
-    """
-    Verifies delete_job(job_id, phase='map') filters by exact job_id label selector,
-    deletes only map K8s Jobs, and leaves reduce_tasks_{job_id} intact.
-    """
+    """Verifies delete_job(job_id, phase='map') deletes only map queue & map K8s Jobs."""
     job_id = "12345678-1111-2222-3333-444444444444"
     mq_mock = AsyncMock()
-    mocker.patch("app.k8s.client.get_rabbitmq_channel", new_callable=AsyncMock, return_value=mq_mock)
-    mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
+    cm_mock = AsyncMock()
+    cm_mock.__aenter__.return_value = mq_mock
+    cm_mock.__aexit__.return_value = None
+    mocker.patch("app.k8s.client.acquire_rabbitmq_channel", return_value=cm_mock)
+    sleep_mock = mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
 
     map_job = MagicMock()
     map_job.metadata.name = "worker-map-12345678-abcde"
@@ -262,30 +302,30 @@ async def test_delete_job_phase_scoped_map_preserves_reduce(
     provider = RealKubernetesProvider()
     await provider.delete_job(job_id, phase="map")
 
+    sleep_mock.assert_not_awaited()
+
     mq_mock.queue_delete.assert_called_once_with(f"map_tasks_{job_id}")
-    mock_k8s_api["list_jobs"].assert_called_once_with(
-        namespace="test-namespace",
-        label_selector=f"job_id={job_id}"
-    )
     mock_k8s_api["delete_job"].assert_called_once_with(
         name="worker-map-12345678-abcde",
         namespace="test-namespace",
-        propagation_policy="Background"
+        propagation_policy="Background",
     )
 
 
 @pytest.mark.asyncio
-async def test_delete_job_all_phases(
+async def test_delete_job_cleans_per_partition_reduce_queues_safely(
     mocker: Any,
     mock_settings: None,
-    mock_k8s_api: Dict[str, Any]
+    mock_k8s_api: Dict[str, Any],
 ) -> None:
-    """
-    Verifies delete_job(job_id) without phase cleans up both map and reduce queues and all job K8s jobs.
-    """
+    """Verifies delete_job cleans map, legacy reduce, and per-partition reduce_tasks_{id}_{p} queues without failing on absent ones."""
     job_id = "12345678-1111-2222-3333-444444444444"
     mq_mock = AsyncMock()
-    mocker.patch("app.k8s.client.get_rabbitmq_channel", new_callable=AsyncMock, return_value=mq_mock)
+    mq_mock.queue_delete.side_effect = [None, RuntimeError("NOT_FOUND"), None, None]
+    cm_mock = AsyncMock()
+    cm_mock.__aenter__.return_value = mq_mock
+    cm_mock.__aexit__.return_value = None
+    mocker.patch("app.k8s.client.acquire_rabbitmq_channel", return_value=cm_mock)
     mocker.patch("app.k8s.client.asyncio.sleep", new_callable=AsyncMock)
 
     map_job = MagicMock()
@@ -293,13 +333,52 @@ async def test_delete_job_all_phases(
     map_job.metadata.labels = {"job_id": job_id}
 
     reduce_job = MagicMock()
-    reduce_job.metadata.name = "worker-reduce-12345678-p0-fghij"
+    reduce_job.metadata.name = "worker-reduce-12345678-fghij"
     reduce_job.metadata.labels = {"job_id": job_id}
 
     mock_k8s_api["list_jobs"].return_value = MagicMock(items=[map_job, reduce_job])
 
     provider = RealKubernetesProvider()
-    await provider.delete_job(job_id)
+    await provider.delete_job(job_id, num_reducers=2)
 
-    assert mq_mock.queue_delete.call_count == 2
+    deleted_queues = [call.args[0] for call in mq_mock.queue_delete.call_args_list]
+    assert deleted_queues == [
+        f"map_tasks_{job_id}",
+        f"reduce_tasks_{job_id}",
+        f"reduce_tasks_{job_id}_0",
+        f"reduce_tasks_{job_id}_1",
+    ]
     assert mock_k8s_api["delete_job"].call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_active_pod_counts_by_job_batches_single_call(
+    mocker: Any,
+    mock_settings: None,
+    mock_k8s_api: Dict[str, Any],
+) -> None:
+    """Verifies get_active_pod_counts_by_job issues ONE list_namespaced_pod call and groups Running/Pending pods."""
+    p1 = MagicMock()
+    p1.metadata.labels = {"job_id": "job-a"}
+    p1.status.phase = "Running"
+    p2 = MagicMock()
+    p2.metadata.labels = {"job_id": "job-a"}
+    p2.status.phase = "Pending"
+    p3 = MagicMock()
+    p3.metadata.labels = {"job_id": "job-b"}
+    p3.status.phase = "Succeeded"
+
+    mock_k8s_api["list_pods"].return_value = MagicMock(items=[p1, p2, p3])
+
+    provider = RealKubernetesProvider()
+    mocker.patch.object(k8s_client_module, "_global_k8s_provider", provider)
+    counts = await get_active_pod_counts_by_job()
+
+    mock_k8s_api["list_pods"].assert_awaited_once_with(
+        namespace="test-namespace",
+        label_selector="app=worker-node",
+    )
+    assert counts == {"job-a": 2}
+
+    await teardown_k8s()
+    mock_k8s_api["api_instance"].close.assert_awaited_once()

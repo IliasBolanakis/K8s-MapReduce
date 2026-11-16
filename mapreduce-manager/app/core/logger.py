@@ -19,27 +19,37 @@ from pythonjsonlogger import json
 #: Async-safe context variable to track Job IDs across concurrent tasks.
 #: Defaults to 'system' for non-job related orchestration events.
 job_id_var: ContextVar[str] = ContextVar("job_id", default="system")
+#: Async-safe context variable tracking the active task or partition ID.
+task_id_var: ContextVar[str] = ContextVar("task_id", default="-")
+#: Async-safe context variable tracking the fenced execution attempt ID.
+attempt_id_var: ContextVar[int] = ContextVar("attempt_id", default=0)
 
 
 class JobContextFilter(logging.Filter):
     """
     Logging filter for dynamic context injection.
 
-    This filter intercepts every log record and injects the current value
-    stored in :data:`job_id_var`. This enables a single request to be traced
-    through multiple asynchronous operations.
+    This filter intercepts every log record and injects the current values
+    stored in :data:`job_id_var`, :data:`task_id_var`, and :data:`attempt_id_var`.
+    This enables a single request or task attempt to be traced through multiple
+    asynchronous operations.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         """
-        Injects the current job_id into the log record.
+        Injects the current correlation context into the log record.
 
         :param record: The log record to be modified.
         :type record: logging.LogRecord
         :return: Always returns True to ensure the record is processed.
         :rtype: bool
         """
-        record.job_id = job_id_var.get()  # type: ignore[attr-defined]
+        if not hasattr(record, "job_id"):
+            record.job_id = job_id_var.get()  # type: ignore[attr-defined]
+        if not hasattr(record, "task_id"):
+            record.task_id = task_id_var.get()  # type: ignore[attr-defined]
+        if not hasattr(record, "attempt_id"):
+            record.attempt_id = attempt_id_var.get()  # type: ignore[attr-defined]
         return True
 
 
@@ -56,7 +66,9 @@ def setup_logging() -> None:
         * **levelname**: Standard log level (INFO, WARN, ERROR).
         * **name**: The name of the module generating the log.
         * **message**: The log message.
-        * **job_id**: The correlation ID injected via JobContextFilter.
+        * **job_id**: The job correlation ID injected via JobContextFilter.
+        * **task_id**: The task or partition identifier injected via JobContextFilter.
+        * **attempt_id**: The monotonic fencing attempt ID injected via JobContextFilter.
 
     :return: None
     :rtype: None
@@ -72,7 +84,7 @@ def setup_logging() -> None:
 
     # Structured format required for modern observability platforms.
     formatter = json.JsonFormatter(
-        '%(asctime)s %(levelname)s %(name)s %(message)s %(job_id)s'
+        '%(asctime)s %(levelname)s %(name)s %(message)s %(job_id)s %(task_id)s %(attempt_id)s'
     )
 
     handler.setFormatter(formatter)

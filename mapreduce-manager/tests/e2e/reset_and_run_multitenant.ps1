@@ -24,8 +24,8 @@ Write-Host "`n[INFO] Purging previous cluster state and ensuring seeded infrastr
 kubectl rollout status deployment/manager-api -n $K8S_NAMESPACE --timeout=180s
 kubectl rollout status daemonset/external-shuffle-service -n $K8S_NAMESPACE --timeout=180s
 
-$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -WindowStyle Hidden
-$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -WindowStyle Hidden
+$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -NoNewWindow
+$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -NoNewWindow
 
 try {
     Start-Sleep -Seconds 3

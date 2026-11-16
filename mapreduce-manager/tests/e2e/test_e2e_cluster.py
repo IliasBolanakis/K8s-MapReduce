@@ -266,6 +266,17 @@ def _read_reduced_results(minio_client: Minio, user_id: str, job_id: str) -> Dic
     return totals
 
 
+def _assert_redis_capacity_clean(redis_client: redis.Redis, job_ids: List[str]) -> None:
+    """Verifies zero leaked per-job or cluster-wide Redis capacity permits."""
+    for jid in job_ids:
+        assert redis_client.hget("cluster:global_capacity_semaphore", jid) is None
+        assert redis_client.get(f"job:{jid}:reduce_waiting_slots") is None
+    active_workers = sum(int(v) for v in redis_client.hvals("cluster:global_capacity_semaphore"))
+    reduce_waiting = int(redis_client.get("cluster:reduce_waiting") or 0)
+    assert active_workers == 0, f"Leaked active_workers in Redis: {active_workers}"
+    assert reduce_waiting == 0, f"Leaked reduce_waiting in Redis: {reduce_waiting}"
+
+
 def _wait_for_k8s_cleanup(job_id: str, timeout_seconds: float = 60.0) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -356,7 +367,7 @@ async def test_single_job_wordcount_with_combiner_multi_chunk(
     assert row["completed_reduce_chunks"] == 2
 
     _wait_for_k8s_cleanup(job_id)
-    assert redis_client.hget("cluster:global_capacity_semaphore", job_id) is None
+    _assert_redis_capacity_clean(redis_client, [job_id])
 
     actual_totals = _read_reduced_results(minio_client, DEFAULT_USER_ID, job_id)
     expected_totals = {
@@ -448,6 +459,8 @@ async def test_multitenant_concurrent_text_and_csv_jobs(
         _wait_for_job_completion(manager_url, jid, timeout_seconds=360.0)
         _wait_for_k8s_cleanup(jid)
         assert redis_client.hget("cluster:global_capacity_semaphore", jid) is None
+
+    _assert_redis_capacity_clean(redis_client, [job1_id, job2_id, job3_id])
 
     conn = await asyncpg.connect(postgres_dsn)
     try:

@@ -81,6 +81,33 @@ def generate_chunk_splits(file_size: int) -> Iterator[Tuple[int, int]]:
         yield offset, length
 
 
+def get_chunk_split(chunk_index: int, file_size: int) -> Tuple[int, int]:
+    """
+    Computes the byte-range boundary ``(byte_offset, byte_length)`` for a single
+    Map chunk index in strict O(1) time and O(1) memory (ADR-05).
+
+    :param chunk_index: Zero-based Map chunk index.
+    :type chunk_index: int
+    :param file_size: Total size of the target input object in bytes.
+    :type file_size: int
+    :return: Tuple of ``(byte_offset, byte_length)``.
+    :rtype: Tuple[int, int]
+    :raises ValueError: If ``chunk_index`` or computed ``byte_offset`` is out of bounds.
+    """
+    if file_size <= 0 or chunk_index < 0:
+        raise ValueError(
+            f"Chunk index {chunk_index} is out of bounds for file_size={file_size}."
+        )
+    chunk_size = settings.CHUNK_SIZE_BYTES
+    offset = chunk_index * chunk_size
+    if offset >= file_size:
+        raise ValueError(
+            f"Chunk index {chunk_index} (offset={offset}) is out of bounds for file_size={file_size}."
+        )
+    length = min(chunk_size, file_size - offset)
+    return offset, length
+
+
 def validate_reducers(count: int) -> Tuple[bool, str]:
     """
     Validates a user-provided reducer count against infrastructure limits.

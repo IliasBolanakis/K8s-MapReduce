@@ -54,6 +54,11 @@ class Settings(BaseSettings):
             of incoming JWT tokens (e.g., from the Keycloak realm).
         JWT_ALGORITHM (str): The cryptographic algorithm used for JWT signing.
         JWT_AUDIENCE (str): The intended audience claim required in the JWT payload.
+        RABBITMQ_CHANNEL_POOL_SIZE (int): Bounded size of the AMQP publisher/RPC
+            channel pool (recommended 4-8).
+        RABBITMQ_ORCHESTRATION_PREFETCH (int): QoS prefetch limit for the isolated
+            orchestration_events_queue consumer channel.
+        ESS_SECRET_KEY (str): Shared HMAC-SHA256 secret used to sign job shuffle tokens.
     """
 
     # --- Orchestration Constraints ---
@@ -76,7 +81,10 @@ class Settings(BaseSettings):
     # --- Core Infrastructure Connections ---
     DATABASE_URL: str = "postgresql://postgres:DisSami2026!@localhost:5432/dds_db"
     RABBITMQ_URL: str = "amqp://guest:guest@localhost:5672/"
+    RABBITMQ_CHANNEL_POOL_SIZE: int = 8
+    RABBITMQ_ORCHESTRATION_PREFETCH: int = 10
     REDIS_URL: str = "redis://localhost:6379/0"
+    ESS_SECRET_KEY: str = "dev-insecure-shared-secret"
 
     # --- MinIO / S3 Storage Settings ---
     MINIO_ENDPOINT: str = "localhost:9000"

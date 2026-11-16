@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -128,18 +129,20 @@ class ShufflePartitionerTest {
         String testKey = "atomic-key";
         int expectedPartition = (testKey.hashCode() & Integer.MAX_VALUE) % 3;
         Path partitionDir = tempDir.resolve(testJobId).resolve(String.valueOf(expectedPartition));
-        Path tmpPath = partitionDir.resolve(testMapId + ".tmp");
+        Path tmpPath = partitionDir.resolve(testMapId + ".attempt.0.tmp");
         Path finalPath = partitionDir.resolve(testMapId + ".lz4");
+        Path fencePath = partitionDir.resolve(testMapId + ".attempt");
 
         partitioner.appendThreadSafe(List.of(new KeyValuePair(testKey, "1")));
 
-        assertTrue(Files.exists(tmpPath), "Active partition should write to .tmp before close()");
+        assertTrue(Files.exists(tmpPath), "Active partition should write to .attempt.0.tmp before close()");
         assertFalse(Files.exists(finalPath), ".lz4 must not exist before close() finalizes the stream");
 
         partitioner.close();
 
         assertFalse(Files.exists(tmpPath), ".tmp must be removed after atomic move on close()");
         assertTrue(Files.exists(finalPath), ".lz4 must exist after close()");
+        assertEquals("0", Files.readString(fencePath, StandardCharsets.UTF_8).trim());
     }
 
     @Test
@@ -147,7 +150,7 @@ class ShufflePartitionerTest {
     void testFailureCleanup_FlushFailureDeletesTmpAndLeavesNoLz4() throws Exception {
         int failingPartition = 0;
         Path partitionDir = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition));
-        Path tmpPath = partitionDir.resolve(testMapId + ".tmp");
+        Path tmpPath = partitionDir.resolve(testMapId + ".attempt.0.tmp");
         Path finalPath = partitionDir.resolve(testMapId + ".lz4");
         Files.writeString(tmpPath, "partial-data");
 
@@ -174,13 +177,13 @@ class ShufflePartitionerTest {
         int failingPartition = (okPartition + 1) % 3;
 
         partitioner.appendThreadSafe(List.of(new KeyValuePair(okKey, "1")));
-        Path okTmp = tempDir.resolve(testJobId).resolve(String.valueOf(okPartition)).resolve(testMapId + ".tmp");
+        Path okTmp = tempDir.resolve(testJobId).resolve(String.valueOf(okPartition)).resolve(testMapId + ".attempt.0.tmp");
         Path okLz4 = tempDir.resolve(testJobId).resolve(String.valueOf(okPartition)).resolve(testMapId + ".lz4");
         assertTrue(Files.exists(okTmp));
 
         // Pick a key that hashes to failingPartition
         String failKey = findKeyForPartition(failingPartition, 3);
-        Path failTmp = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition)).resolve(testMapId + ".tmp");
+        Path failTmp = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition)).resolve(testMapId + ".attempt.0.tmp");
         Path failLz4 = tempDir.resolve(testJobId).resolve(String.valueOf(failingPartition)).resolve(testMapId + ".lz4");
         Files.writeString(failTmp, "partial");
 
@@ -202,6 +205,56 @@ class ShufflePartitionerTest {
         assertFalse(Files.exists(okLz4), "No .lz4 file may be promoted after a write failure");
         assertFalse(Files.exists(failTmp), "Failing partition .tmp file must be deleted");
         assertFalse(Files.exists(failLz4), "Failing partition .lz4 file must not exist");
+    }
+
+    @Test
+    void testAttemptFencing_DropsStaleAttemptWithoutOverwritingNewerAttempt() throws IOException {
+        String key = "fenced-key";
+        int partition = (key.hashCode() & Integer.MAX_VALUE) % 3;
+        Path partitionDir = tempDir.resolve(testJobId).resolve(String.valueOf(partition));
+        Path finalLz4 = partitionDir.resolve(testMapId + ".lz4");
+        Path fenceFile = partitionDir.resolve(testMapId + ".attempt");
+
+        // Newer attempt 2 commits first
+        try (ShufflePartitioner attempt2 = new ShufflePartitioner(baseShuffleDir, testJobId, testMapId, 3, 2)) {
+            attempt2.appendThreadSafe(List.of(new KeyValuePair(key, "winner-v2")));
+        }
+        assertEquals("2", Files.readString(fenceFile, StandardCharsets.UTF_8).trim());
+        assertEquals("fenced-key\twinner-v2\n", readCompressedFile(finalLz4));
+
+        // Stale zombie attempt 1 finishes late: stages to .attempt.1.tmp, fenced out on close()
+        ShufflePartitioner staleAttempt1 = new ShufflePartitioner(baseShuffleDir, testJobId, testMapId, 3, 1);
+        staleAttempt1.appendThreadSafe(List.of(new KeyValuePair(key, "stale-v1")));
+        Path staleTmp = partitionDir.resolve(testMapId + ".attempt.1.tmp");
+        assertTrue(Files.exists(staleTmp));
+
+        staleAttempt1.close();
+
+        assertFalse(Files.exists(staleTmp), "Stale .attempt.1.tmp must be deleted when fenced");
+        assertEquals("2", Files.readString(fenceFile, StandardCharsets.UTF_8).trim());
+        assertEquals("fenced-key\twinner-v2\n", readCompressedFile(finalLz4));
+
+        // Attempt 3 (higher attemptId) supersedes attempt 2
+        try (ShufflePartitioner attempt3 = new ShufflePartitioner(baseShuffleDir, testJobId, testMapId, 3, 3)) {
+            attempt3.appendThreadSafe(List.of(new KeyValuePair(key, "winner-v3")));
+        }
+        assertEquals("3", Files.readString(fenceFile, StandardCharsets.UTF_8).trim());
+        assertEquals("fenced-key\twinner-v3\n", readCompressedFile(finalLz4));
+    }
+
+    @Test
+    void testLz4Framing_Uses256KbBlockSize() throws IOException {
+        String key = "lz4-block-key";
+        int partition = (key.hashCode() & Integer.MAX_VALUE) % 3;
+
+        partitioner.appendThreadSafe(List.of(new KeyValuePair(key, "payload")));
+        partitioner.close();
+
+        Path lz4File = tempDir.resolve(testJobId).resolve(String.valueOf(partition)).resolve(testMapId + ".lz4");
+        byte[] bytes = Files.readAllBytes(lz4File);
+        assertTrue(bytes.length >= 7, "Valid LZ4 frame must include header");
+        // LZ4 frame BD byte (index 5) encodes Block MaxSize in bits 6-4: 5 (0x50) == 256KB
+        assertEquals(0x50, bytes[5] & 0x70, "Expected LZ4 BLOCKSIZE.SIZE_256KB (BD bits 0x50)");
     }
 
     private String findKeyForPartition(int targetPartition, int numReducers) {

@@ -1,6 +1,6 @@
 # MapReduce Orchestrator (Manager Service)
 
-The **MapReduce Orchestrator** (`mapreduce-manager/`) is the central control plane for the Kubernetes-native MapReduce framework. It handles multi-tenant job scheduling, O(1) memory data splitting, RabbitMQ task distribution, Redis barrier synchronization, Kubernetes Batch Job provisioning, and autonomous fault recovery.
+The **MapReduce Orchestrator** (`mapreduce-manager/`) is the central control plane for the Kubernetes-native MapReduce framework. It handles multi-tenant job scheduling, O(1) memory/time data splitting, isolated RabbitMQ task distribution, atomic Redis barrier synchronization and capacity swaps, fenced execution attempts, event-driven Kubernetes Batch Job orchestration, and autonomous fault recovery.
 
 ---
 
@@ -9,51 +9,64 @@ The **MapReduce Orchestrator** (`mapreduce-manager/`) is the central control pla
 The Manager operates as an **Event-Driven, Active-Active Service** backed by four infrastructure components:
 
 1. **PostgreSQL (`asyncpg`):** ACID source of truth for multi-tenant job history, format metadata, and recovery state (`init-db.sql` / `app/k8s/infrastructure/postgres-configmap.yaml`).
-2. **Redis (`redis.asyncio`):** Idempotency locks, global worker capacity semaphores, Watchdog/Reconciler leader locks, Lua-scripted Map/Reduce completion barriers, and `job:<id>:worker_endpoints` shuffle routing tables.
-3. **RabbitMQ (`aio-pika`):** Dynamic lazy queues (`map_tasks_<jobId>`, `reduce_tasks_<jobId>`), `job_events_queue`, `orchestration_events_queue`, and a bound `FANOUT` Dead Letter Exchange (`dead_letter_exchange` -> `dead_letter_queue`).
-4. **Kubernetes API (`kubernetes_asyncio`):** Provisions `worker-template.yaml` Batch V1 Jobs (`mapreduce-worker:v10`) and cleans up phase-scoped jobs (`delete_job(job_id, phase=...)`).
+2. **Redis (`redis.asyncio`):** Idempotency locks, atomic global capacity semaphore (`cluster:global_capacity_semaphore`), waiting-Reducer reservation watermark (`cluster:reduce_waiting`, `job:<id>:reduce_waiting_slots`), Watchdog/Reconciler leader locks, monotonic attempt fencing (`job:<id>:attempts`), Lua-scripted Map/Reduce completion barriers, and O(K)/O(M/K) shuffle routing sets (`job:<id>:ess_nodes`, `job:<id>:node_tasks:<ep>`).
+3. **RabbitMQ (`aio-pika`):** Isolated consumer channels (`job_events_queue` prefetch `100`, `orchestration_events_queue` prefetch `RABBITMQ_ORCHESTRATION_PREFETCH`), a bounded publisher/RPC channel pool (`acquire_rabbitmq_channel`, `RABBITMQ_CHANNEL_POOL_SIZE=8`) with automatic closed-channel replacement, dynamic lazy queues (`map_tasks_<jobId>`, `reduce_tasks_<jobId>_<pId>`), and a bound `FANOUT` Dead Letter Exchange (`dead_letter_exchange` -> `dead_letter_queue`).
+4. **Kubernetes API (`kubernetes_asyncio`):** Lifecycle-managed pooled `ApiClient` on `RealKubernetesProvider` provisioning `worker-template.yaml` Batch V1 Jobs (`mapreduce-worker:v10`), async `watch.Watch()` job completion monitoring (with `410 Gone` relist recovery), single-call batched Reconciler pod checks, and phase-scoped teardown (`delete_job(job_id, phase=..., num_reducers=...)`).
 
 ---
 
 ## ✨ Core Execution & Resilience
 
-### 1. O(1) Memory Footprint Data Partitioning
+### 1. O(1) Memory & Time Data Partitioning (ADR-05)
 
-Uses Python generators (`orchestrator.generate_chunk_splits`) to stream 128 MiB byte-range boundaries sequentially to RabbitMQ lazy queues without materializing giant split arrays in Manager memory.
+* Uses Python generators (`orchestrator.generate_chunk_splits`) to stream 128 MiB byte-range boundaries sequentially to RabbitMQ lazy queues without materializing split arrays in Manager memory.
+* Surgical lineage recovery (`TaskPublisher.republish_single_map_task`) uses direct O(1) byte-offset arithmetic via `orchestrator.get_chunk_split(chunk_index, file_size)` rather than generator scanning.
 
-### 2. Multi-Tenant Sandboxing & Format Propagation
+### 2. Indexed Reduce Jobs & Per-Partition Queues (ADR-04)
 
-Tracks tenant ownership via `user_id`, derives Java class names from uploaded `.class` filenames, isolates output keys to `s3://results/<user_id>/<job_id>/`, and propagates `TaskMessage.format` (`JSON`, `AVRO`, `XML`, `TEXT`, `CSV`) end-to-end across initial scheduling, lineage recovery, and Reduce tasks.
+* **Normal Reduce Phase:** Declares and publishes each partition `p_id` (`0..num_reducers-1`) to its deterministic lazy queue `reduce_tasks_<job_id>_<p_id>` **before** spawning **1** Kubernetes `BatchV1` `Indexed` Job (`completionMode: Indexed`, `completions: num_reducers`, `parallelism: min(num_reducers, MAX_TOTAL_WORKERS)`, `backoffLimitPerIndex: 3`, `restartPolicy: Never`, `terminationGracePeriodSeconds: 40`).
+* **Targeted Single-Partition Recovery:** Spawns a single non-indexed Job (`backoffLimit: 4`, `restartPolicy: OnFailure`, `PARTITION_ID` env var injected) consuming from `reduce_tasks_<job_id>_<p_id}` with soft `nodeAffinity` locality.
+* **Queue Cleanup:** `delete_job` cleans up `map_tasks_<job_id>`, legacy `reduce_tasks_<job_id>`, and all per-partition `reduce_tasks_<job_id>_<p_id>` queues safely.
 
-### 3. Mid-Stream Local Reduction (Combiners)
+### 3. Atomic Map-to-Reduce Capacity Swap & `reduce_waiting` Watermark (ADR-05)
 
-Persists `combiner_filename` in PostgreSQL (`init-db.sql` and `postgres-configmap.yaml`) and propagates optional `combiner_code_object` / `combiner_class_name` in both initial Map dispatches and `_recover_lost_map_task` lineage recoveries.
+* `CacheRepository.swap_map_to_reduce_capacity` executes a single atomic Lua script that releases a job's Map slots and either immediately claims `num_reducers` slots OR registers `num_reducers` in `cluster:reduce_waiting` (tracked per job in `job:<id>:reduce_waiting_slots`) without holding partial active slots.
+* `CacheRepository.reserve_cluster_capacity` bounds incoming Map capacity by `max_capacity - active_workers - reduce_waiting`, preventing new Map jobs from starving waiting Reducers. `release_job_capacity` / `forcefully_reclaim_job` atomically clear both active slots and any waiting watermark on job failure or cancellation.
 
-### 4. Stateful Barriers & Data Locality
+### 4. Monotonic Attempt Fencing & Staged Reduce Promotion (ADR-06)
 
-* **Lua-Backed Barriers:** Atomic Redis Lua scripts track unique completed task IDs (`map_completed_set`, `reduce_completed_set`) and trigger phase transitions exactly once.
-* **Locality Scheduling:** Splits `nodeName@@IP:Port` addresses reported by Map workers (`CacheRepository.add_worker_endpoint`), pins Reducer pods via soft Kubernetes `nodeAffinity` (`TARGET_NODE`), and supplies clean `IP:Port` ESS endpoints in `TaskMessage.worker_endpoints`.
-* **Phase-Scoped Teardown & Saga Rollback:** `process_orchestration_event` cleans up only Map-phase pods/queues under an idempotency lock (preserving `reduce_tasks_<jobId>`) and uses delayed backoff on cluster capacity starvation. `routes.py` cleans up `SUBMITTED` DB rows and reserved Redis capacity on `503`/`404` or Saga errors.
+* `TaskPublisher` (Map & recovery) and `TaskEventProcessor._trigger_reduce_phase` (Reduce) mint monotonic `attemptId` values via pipelined `HINCRBY job:<id>:attempts <task_id> 1` (24h TTL).
+* `TaskEventProcessor.process_message` validates `WorkerSignal.attempt_id` against Redis and drops stale zombie signals with a structured warning (`job_id`, `task_id`, `attempt_id`, `expected_attempt_id`).
+* For fenced Reduce completions (`attemptId > 0`), `StorageService.promote_staged_reduce_output` copies `results/<user_id>/<job_id>/_attempts/part_<p>_attempt_<a>.staging` to `results/<user_id>/<job_id>/result_part_<p>.txt` and deletes the staging object before advancing the Reduce barrier. Any leftover `_attempts/` objects are purged on final completion.
 
-### 5. Hybrid Retry, Fail-Fast & Reactive Lineage Recovery
+### 5. Pooled K8s `ApiClient`, Async Watch & Batched Reconciler (ADR-11)
 
-* **Manager-Owned Retries & Fail-Fast:** Deterministic user-code errors (`NullPointerException`, `ClassCastException`, `OutOfMemoryError`, `Exception in User Code`) immediately trigger `forcefully_reclaim_job`; transient worker `FAILED` signals (`strikes < 3`) ACK the event signal, provision a replacement pod, and republish the failed Map or Reduce task.
-* **Node-Aware Lineage Recovery:** Handles both `SHUFFLE_FETCH_FAILED:<taskId>` and `SHUFFLE_FETCH_FAILED_FROM_NODE:<ip:port>` by looking up affected Map tasks in `job:{job_id}:worker_endpoints` (`CacheRepository.get_tasks_by_endpoint`), waitlisting the stalled Reducer, and surgically re-running only the lost Map chunks.
+* `RealKubernetesProvider` reuses one shared `ApiClient` across `spawn_workers`, `wait_for_job_completion`, `delete_job`, and Reconciler pod queries, closed cleanly in FastAPI `lifespan` via `teardown_k8s()`.
+* `wait_for_job_completion` uses `kubernetes_asyncio.watch.Watch()` on `list_namespaced_job` (capturing `resource_version` and recovering from `410 Gone` by relisting).
+* `reconciler.py` executes a single `list_namespaced_pod(label_selector="app=worker-node")` query per cycle grouped by `labels["job_id"]`.
+
+### 6. O(K) / O(M/K) Redis Shuffle Directory & AMQP Isolation (ADR-12, ADR-13)
+
+* `CacheRepository` stores ESS bind addresses in `SET job:<id>:ess_nodes` (`O(K)`) and maps normalized `IP:Port` endpoints to Map tasks in `SET job:<id>:node_tasks:<norm_ep>` (`O(M/K)`), purged on job teardown.
+* `app/core/rabbitmq.py` isolates `job_events_queue` and `orchestration_events_queue` onto dedicated channels and serves publisher/RPC traffic from a bounded `asyncio.Queue` pool (`RABBITMQ_CHANNEL_POOL_SIZE=8`) with transparent replacement of closed channels.
+
+---
+
+## 📊 Structured Logging (MDC ContextVars)
+
+`app/core/logger.py` emits JSON logs to `stdout` via `JobContextFilter`, automatically injecting:
+
+* `asctime`, `levelname`, `name`, `message`
+* `job_id` (default `"system"`)
+* `task_id` (default `"-"`)
+* `attempt_id` (default `0`)
 
 ---
 
 ## 🤖 Autonomous Background Services
 
-* **The Watchdog (`app/services/watchdog.py`):** Periodically sweeps stale `RUNNING` jobs exceeding `GLOBAL_JOB_TIMEOUT` and invokes `forcefully_reclaim_job`.
-* **The Reconciler (`app/services/reconciler.py`):** Compares Redis capacity reservations against live Kubernetes pods and reclaims phantom allocations with zero active pods past the grace window.
-
----
-
-## 🔬 Architectural Trade-offs & Future Scalability
-
-1. **Redis CP vs. AP Guarantees:** Redis is single-replica without persistence in the baseline manifest; HA production deployments should add AOF/PVC or Sentinel plus fenced leader leases.
-2. **Kubernetes API Polling vs. Informers:** `wait_for_job_completion` and the `Reconciler` poll the Kubernetes API; large-scale clusters should migrate to Kubernetes SharedInformers and `Indexed` Reduce Jobs.
-3. **Task Batching vs. Maximum Parallelism:** `get_optimal_worker_count` defaults to `MAP_TASKS_PER_POD = 5` to amortize pod boot overhead across chunks.
+* **The Watchdog (`app/services/watchdog.py`):** Periodically sweeps stale `RUNNING` jobs exceeding `GLOBAL_JOB_TIMEOUT` under a Redis leader lock and invokes `forcefully_reclaim_job`.
+* **The Reconciler (`app/services/reconciler.py`):** Performs one batched pod list query per cycle, compares against `cluster:global_capacity_semaphore`, and reclaims phantom allocations with zero active pods past the 60s grace window.
 
 ---
 
@@ -85,7 +98,7 @@ Build the Manager image inside Minikube's Docker daemon (`mapreduce-manager:v1`)
 docker build -t mapreduce-manager:v1 .
 ```
 
-Apply infrastructure, RBAC, Service (`NodePort 30000`), Deployment (`replicas: 2`), and ESS DaemonSet from `mapreduce-manager/`:
+Apply infrastructure, RBAC, Service (`NodePort 30000`), Deployment (`replicas: 2`), and ESS DaemonSet (`ESS_MAX_LOCAL_STREAMS=64`, `ESS_MAX_S3_CONCURRENCY=32`, `terminationGracePeriodSeconds=40`) from `mapreduce-manager/`:
 
 ```powershell
 kubectl apply -f app/k8s/infrastructure/postgres-configmap.yaml
@@ -94,16 +107,10 @@ kubectl apply -f app/k8s/infrastructure/redis.yaml
 kubectl apply -f app/k8s/infrastructure/minio.yaml
 kubectl apply -f app/k8s/infrastructure/rabbitmq.yaml
 
-# Fallback if Docker Hub rejects minio/minio:latest pull:
-# kubectl set image deployment/minio minio=cgr.dev/chainguard/minio:latest
-
 kubectl apply -f app/k8s/manager/manager-rbac.yaml
 kubectl apply -f app/k8s/manager/manager-service.yaml
 kubectl apply -f app/k8s/manager/manager-deployment.yaml
 kubectl apply -f app/k8s/templates/ess-daemonset.yaml
-
-# Optional for unauthenticated local E2E testing:
-# kubectl set env deployment/manager-api ENABLE_AUTH=false
 ```
 
 ### Local Development Setup (Docker Compose + Uvicorn)
@@ -144,6 +151,8 @@ Configured via environment variables (see `app/core/config.py`):
 | `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:DisSami2026!@localhost:5432/dds_db` |
 | `REDIS_URL` | Redis connection string | `redis://localhost:6379/0` |
 | `RABBITMQ_URL` | RabbitMQ connection string | `amqp://guest:guest@localhost:5672/` |
+| `RABBITMQ_CHANNEL_POOL_SIZE` | Bounded AMQP publisher/RPC channel pool size (4–8 recommended) | `8` |
+| `RABBITMQ_ORCHESTRATION_PREFETCH` | QoS prefetch limit for isolated `orchestration_events_queue` channel | `10` |
 | `MINIO_ENDPOINT` | MinIO S3 endpoint (`host:port`) | `localhost:9000` |
 | `MINIO_ACCESS_KEY` | MinIO access key | `minioadmin` |
 | `MINIO_SECRET_KEY` | MinIO secret key | `minioadmin` |
@@ -158,21 +167,21 @@ Configured via environment variables (see `app/core/config.py`):
 | `ESS_SECRET_KEY` | Shared HMAC-SHA256 secret for ESS tokens | `dev-insecure-shared-secret` |
 | `MOCK_K8S` | Run with mock Kubernetes provider | `False` |
 
-> **Worker Pod Sizing (`app/k8s/templates/worker-template.yaml`):** Sets `JAVA_OPTS="-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m"` inside `2Gi` memory limits so the parent worker and child `SandboxRunner` (`-XX:MaxRAMPercentage=50.0`) fit within the pod cgroup without `OOMKilled` (exit 137).
+> **Worker Pod Sizing (`app/k8s/templates/worker-template.yaml`):** Sets `JAVA_OPTS="-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"` inside `2Gi` memory limits with `terminationGracePeriodSeconds: 40` for fast C1 cold-boot without C2 JIT storms and ADR-14 graceful drain headroom.
 
 ---
 
 ## 🧪 Testing
 
 ```bash
-# Unit tests (48 tests)
-pytest tests/unit -q
+# Unit tests
+python -m pytest tests/unit -q
 
-# Integration tests (Testcontainers PostgreSQL & RabbitMQ)
-pytest tests/integration -q
+# Integration tests (Testcontainers PostgreSQL, RabbitMQ, and Redis Lua)
+python -m pytest tests/integration -q
 
 # Live Minikube E2E tests (requires running Minikube cluster with deployed services)
-pytest tests/e2e -v
+python -m pytest tests/e2e -v
 ```
 
 `tests/e2e/` includes `test_e2e_cluster.py`, Java fixtures under `tests/e2e/fixtures/`, and aligned PowerShell orchestration scripts (`start_infra_and_seed.ps1`, `reset_and_run_default.ps1`, `reset_and_run_large_file.ps1`, `reset_and_run_multitenant.ps1`, `deep_purge.ps1`).

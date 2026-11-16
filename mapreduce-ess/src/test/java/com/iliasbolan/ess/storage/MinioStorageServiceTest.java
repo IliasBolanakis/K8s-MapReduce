@@ -10,9 +10,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -127,5 +133,129 @@ class MinioStorageServiceTest {
             assertFalse(siblings.anyMatch(p -> p.toString().endsWith(".tmp")),
                     "No .tmp staging directory should remain after atomic move");
         }
+    }
+
+    @Test
+    void resolveMaxS3ConcurrencyDefaultsTo32AndRejectsInvalidValues() {
+        assertEquals(32, MinioStorageService.resolveMaxS3Concurrency(Map.of()));
+        assertEquals(16, MinioStorageService.resolveMaxS3Concurrency(Map.of("ESS_MAX_S3_CONCURRENCY", "16")));
+        assertThrows(IllegalArgumentException.class,
+                () -> MinioStorageService.resolveMaxS3Concurrency(Map.of("ESS_MAX_S3_CONCURRENCY", "0")));
+        assertThrows(IllegalArgumentException.class,
+                () -> new MinioStorageService(DUMMY_CLIENT, "test-bucket", 0));
+    }
+
+    @Test
+    void globalS3ConcurrencyCapEnforcedAcrossSimultaneousSpillAndRestore(@TempDir Path tempDir) throws Exception {
+        int cap = 3;
+        Path spillJobDir = Files.createDirectories(tempDir.resolve("spill-source/job-spill/0"));
+        for (int i = 0; i < 6; i++) {
+            Files.writeString(spillJobDir.resolve("map-" + i + ".lz4"), "spill-data-" + i, StandardCharsets.UTF_8);
+        }
+        Path restoreTargetDir = tempDir.resolve("restore-target/job-restore/1");
+
+        AtomicInteger currentInFlight = new AtomicInteger(0);
+        AtomicInteger maxObservedInFlight = new AtomicInteger(0);
+        CountDownLatch saturatedAtCap = new CountDownLatch(1);
+
+        try (MinioStorageService service = new MinioStorageService(DUMMY_CLIENT, "test-bucket", cap) {
+            @Override
+            protected List<String> listObjectNames(String objectPrefix) {
+                return List.of(
+                        "job-restore/1/seg-0.lz4",
+                        "job-restore/1/seg-1.lz4",
+                        "job-restore/1/seg-2.lz4",
+                        "job-restore/1/seg-3.lz4",
+                        "job-restore/1/seg-4.lz4",
+                        "job-restore/1/seg-5.lz4"
+                );
+            }
+
+            @Override
+            protected void uploadObject(String objectName, Path sourceFile) throws Exception {
+                trackConcurrentIo();
+            }
+
+            @Override
+            protected void downloadObject(String objectName, Path destinationFile) throws Exception {
+                trackConcurrentIo();
+                Files.writeString(destinationFile, "restored-" + destinationFile.getFileName(), StandardCharsets.UTF_8);
+            }
+
+            private void trackConcurrentIo() throws InterruptedException {
+                int active = currentInFlight.incrementAndGet();
+                maxObservedInFlight.accumulateAndGet(active, Math::max);
+                if (active >= cap) {
+                    saturatedAtCap.countDown();
+                }
+                try {
+                    Thread.sleep(60);
+                } finally {
+                    currentInFlight.decrementAndGet();
+                }
+            }
+        }; ExecutorService callers = Executors.newFixedThreadPool(2)) {
+            Future<?> spillFuture = callers.submit(() -> {
+                try {
+                    service.spillJobData("job-spill", tempDir.resolve("spill-source/job-spill"));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            Future<Boolean> restoreFuture = callers.submit(() -> {
+                try {
+                    return service.restorePartition("job-restore", 1, restoreTargetDir);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            assertTrue(saturatedAtCap.await(5, TimeUnit.SECONDS), "Shared S3 pool should saturate up to configured cap");
+            spillFuture.get(10, TimeUnit.SECONDS);
+            assertTrue(restoreFuture.get(10, TimeUnit.SECONDS));
+
+            assertEquals(cap, service.getMaxS3Concurrency());
+            assertTrue(maxObservedInFlight.get() <= cap,
+                    "Total concurrent MinIO operations (" + maxObservedInFlight.get() + ") exceeded cap " + cap);
+            assertEquals(0, currentInFlight.get());
+        }
+    }
+
+    @Test
+    void spillJobDataIgnoresMarkerFilesAndPropagatesPartialFailure(@TempDir Path tempDir) throws Exception {
+        Path jobDir = Files.createDirectories(tempDir.resolve("job-partial-fail/0"));
+        Files.writeString(jobDir.resolve("map-0.lz4"), "ok-0");
+        Files.writeString(jobDir.resolve("map-1.lz4"), "fail-1");
+        Files.writeString(jobDir.resolve("map-2.lz4"), "ok-2");
+        Files.writeString(jobDir.resolve("map-3.lz4.tmp"), "ignore-tmp");
+        Files.writeString(jobDir.resolve("attempt-1.attempt"), "ignore-attempt");
+
+        Set<String> uploadedObjects = ConcurrentHashMap.newKeySet();
+
+        try (MinioStorageService service = new MinioStorageService(DUMMY_CLIENT, "test-bucket", 2) {
+            @Override
+            protected void uploadObject(String objectName, Path sourceFile) throws Exception {
+                uploadedObjects.add(objectName);
+                if (objectName.endsWith("map-1.lz4")) {
+                    throw new IOException("Simulated S3 PutObject failure");
+                }
+            }
+        }) {
+            assertThrows(IOException.class, () -> service.spillJobData("job-partial-fail", tempDir.resolve("job-partial-fail")));
+            assertFalse(uploadedObjects.stream().anyMatch(name -> name.endsWith(".tmp") || name.endsWith(".attempt")),
+                    "Spill must ignore .tmp and .attempt files");
+        }
+    }
+
+    @Test
+    void closeShutsDownTransferPoolAndRejectsSubsequentTransfers(@TempDir Path tempDir) throws Exception {
+        Path jobDir = Files.createDirectories(tempDir.resolve("job-closed/0"));
+        Files.writeString(jobDir.resolve("map-0.lz4"), "data");
+
+        MinioStorageService service = new MinioStorageService(DUMMY_CLIENT, "test-bucket", 2);
+        service.close();
+
+        assertThrows(IOException.class, () -> service.spillJobData("job-closed", tempDir.resolve("job-closed")));
     }
 }

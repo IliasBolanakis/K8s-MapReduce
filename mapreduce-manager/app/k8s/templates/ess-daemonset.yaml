@@ -74,6 +74,10 @@ spec:
           value: "7337"
         - name: ESS_SECRET_KEY
           value: "dev-insecure-shared-secret"
+        - name: ESS_MAX_LOCAL_STREAMS
+          value: "64"
+        - name: ESS_MAX_S3_CONCURRENCY
+          value: "32"
 
         # --- COLD TIER CONFIGURATION (Tiered Storage / S3 Overflow) ---
         # Provides infinite retention by autonomously spilling data to MinIO
@@ -103,4 +107,4 @@ spec:
       - operator: Exists
         effect: NoSchedule
 
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 40

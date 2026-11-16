@@ -6,41 +6,62 @@ import net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Enterprise-grade ShufflePartitioner with O(1) Memory Persistent Streams.
+ * Enterprise-grade {@code ShufflePartitioner} with O(1) memory persistent streams,
+ * 256KB LZ4 block framing, and monotonic {@code attemptId} output fencing.
  * <p>
- * <b>Architectural Fix 1: Zero-Aggregation Write-Through</b><br>
- * Eliminates {@link StringBuilder} buffering that caused heap spikes during massive shuffles.
- * Records are streamed directly to partition-specific {@link BufferedWriter} instances,
- * ensuring the memory footprint remains constant regardless of chunk density or record length.
+ * <b>Architectural Properties:</b>
+ * <ul>
+ * <li><b>Zero-Aggregation Write-Through:</b> Streams records directly to partition-specific
+ * {@link BufferedWriter} instances backed by a 64KB {@link BufferedOutputStream} and
+ * {@link BLOCKSIZE#SIZE_256KB} {@link LZ4FrameOutputStream} frames.</li>
+ * <li><b>Eager Directory Allocation:</b> Pre-allocates all partition directories during
+ * instantiation so the ESS daemon distinguishes truly empty skewed partitions from missing data.</li>
+ * <li><b>Attempt-Fenced Atomic Promotion:</b> Streams stage into
+ * {@code <mapTaskId>.attempt.<attemptId>.tmp}. On {@link #close()}, the partitioner inspects
+ * {@code <mapTaskId>.attempt}; if a newer attempt ({@code existing > attemptId}) already
+ * committed, the stale {@code .tmp} file is discarded without touching {@code <mapTaskId>.lz4}.</li>
+ * </ul>
  * </p>
  * <p>
- * <b>Architectural Fix 2: Eager Directory Allocation (Skew Protection)</b><br>
- * Pre-allocates all partition directories during instantiation. This prevents fatal cache-miss
- * errors in the External Shuffle Service (ESS) overflow tier when highly skewed datasets result
- * in completely empty partitions. By guaranteeing directory existence, the ESS correctly
- * identifies empty partitions rather than triggering unnecessary and failing MinIO restores.
+ * <b>Thread Safety:</b><br>
+ * Concurrent calls to {@link #appendThreadSafe(List)} synchronize on per-partition lock stripes
+ * ({@code partitionLocks[partitionIndex]}). Callers must invoke {@link #close()} after all
+ * {@code appendThreadSafe} calls complete.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.3
+ * @version 3.4
  * @since 2026-05-15
  */
 public class ShufflePartitioner implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(ShufflePartitioner.class);
+
+    /** Buffer size (64KB) wrapping the LZ4 output stream for reduced syscall overhead. */
+    static final int STREAM_BUFFER_BYTES = 64 * 1024;
+
     private final String baseShuffleDir;
     private final String jobId;
     private final String mapTaskId;
     private final int numReducers;
+    private final int attemptId;
     private final Object[] partitionLocks;
 
     /** Persistent cache of open writers to prevent LZ4 frame thrashing. */
@@ -48,7 +69,7 @@ public class ShufflePartitioner implements AutoCloseable {
     private volatile boolean writeFailed = false;
 
     /**
-     * Initializes the ShufflePartitioner and establishes the physical directory boundaries.
+     * Initializes the {@code ShufflePartitioner} with default {@code attemptId = 0}.
      *
      * @param baseShuffleDir The root physical directory for ephemeral shuffle data persistence.
      * @param jobId          The universally unique identifier (UUID) of the overarching MapReduce job.
@@ -57,19 +78,30 @@ public class ShufflePartitioner implements AutoCloseable {
      * @throws RuntimeException If eager directory allocation fails due to disk access limits or I/O faults.
      */
     public ShufflePartitioner(String baseShuffleDir, String jobId, String mapTaskId, int numReducers) {
+        this(baseShuffleDir, jobId, mapTaskId, numReducers, 0);
+    }
+
+    /**
+     * Initializes the {@code ShufflePartitioner} with explicit {@code attemptId} fencing
+     * and eagerly allocates all partition directories.
+     *
+     * @param baseShuffleDir The root physical directory for ephemeral shuffle data persistence.
+     * @param jobId          The universally unique identifier (UUID) of the overarching MapReduce job.
+     * @param mapTaskId      The unique identifier for the specific Map task utilizing this partitioner.
+     * @param numReducers    The total number of allocated Reducers (used to define partition boundaries).
+     * @param attemptId      Monotonic attempt identifier used for staging and zombie-output fencing.
+     * @throws RuntimeException If eager directory allocation fails due to disk access limits or I/O faults.
+     */
+    public ShufflePartitioner(String baseShuffleDir, String jobId, String mapTaskId, int numReducers, int attemptId) {
         this.baseShuffleDir = baseShuffleDir;
         this.jobId = jobId;
         this.mapTaskId = mapTaskId;
         this.numReducers = numReducers;
+        this.attemptId = attemptId;
 
-        // Lock stripping per partition to allow concurrent thread access
         this.partitionLocks = new Object[numReducers];
         for (int i = 0; i < numReducers; i++) {
             this.partitionLocks[i] = new Object();
-
-            // EAGER DIRECTORY ALLOCATION: Data Skew / ESS Empty Partition Fix
-            // Forces the creation of all partition boundaries immediately to guarantee
-            // the ESS Daemon resolves empty streams correctly, bypassing erroneous S3 cache misses.
             try {
                 Files.createDirectories(Paths.get(baseShuffleDir, jobId, String.valueOf(i)));
             } catch (IOException e) {
@@ -80,43 +112,29 @@ public class ShufflePartitioner implements AutoCloseable {
     }
 
     /**
-     * Appends a buffer of mapped records directly to persistent LZ4 streams.
-     * <p>
-     * <b>O(1) Memory Guarantee & Sequential I/O:</b> Groups the micro-batch by partition
-     * in-memory first. This reduces lock acquisitions from O(N) to O(R) (where R is numReducers)
-     * and guarantees sequential disk writes to prevent OS-level disk thrashing.
-     * </p>
+     * Appends a micro-batch of mapped records directly to persistent 256KB-block LZ4 streams.
      *
      * @param buffer A transient, micro-batched collection of {@link KeyValuePair} records.
      * @throws IOException If physical disk writes or stream access operations fail.
      */
     public void appendThreadSafe(List<KeyValuePair> buffer) throws IOException {
-
-        // 1. Group the micro-batch locally by partition to minimize lock contention
         @SuppressWarnings("unchecked")
         List<KeyValuePair>[] groupedByPartition = new List[numReducers];
 
         for (KeyValuePair pair : buffer) {
             int partitionIndex = (pair.key().hashCode() & Integer.MAX_VALUE) % numReducers;
-
             if (groupedByPartition[partitionIndex] == null) {
-                // Initialize with a small capacity to prevent array reallocation overhead
                 groupedByPartition[partitionIndex] = new ArrayList<>(buffer.size() / numReducers + 10);
             }
             groupedByPartition[partitionIndex].add(pair);
         }
 
-        // 2. Flush to disk: Acquire the lock ONCE per active partition
         for (int i = 0; i < numReducers; i++) {
             List<KeyValuePair> partitionRecords = groupedByPartition[i];
-
             if (partitionRecords != null && !partitionRecords.isEmpty()) {
-                // ONE lock acquisition for the entire sub-batch destined for this file
                 synchronized (partitionLocks[i]) {
                     try {
                         BufferedWriter writer = getOrCreateWriter(i);
-
-                        // Sequential write to the OS buffer
                         for (KeyValuePair pair : partitionRecords) {
                             writer.write(pair.key());
                             writer.write('\t');
@@ -133,30 +151,28 @@ public class ShufflePartitioner implements AutoCloseable {
     }
 
     /**
-     * Retrieves a cached writer or dynamically provisions a new LZ4 stream for the partition.
+     * Retrieves a cached writer or provisions a new attempt-staged LZ4 stream for the partition.
      *
-     * @param partitionIndex The mathematical routing destination for the data payload.
-     * @return A ready-to-write, buffered, LZ4-compressed output stream.
-     * @throws IOException If the file cannot be created or opened for I/O operations.
+     * @param partitionIndex The target partition index ({@code 0 .. numReducers - 1}).
+     * @return A buffered UTF-8 writer backed by a 64KB buffer and 256KB-block LZ4 frame stream.
+     * @throws IOException If creating or opening the staging file fails.
      */
     private BufferedWriter getOrCreateWriter(int partitionIndex) throws IOException {
         BufferedWriter cachedWriter = writerCache.get(partitionIndex);
-        if (cachedWriter != null) return cachedWriter;
+        if (cachedWriter != null) {
+            return cachedWriter;
+        }
 
         Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
-
-        // Note: Directory is guaranteed to exist due to eager allocation in the constructor,
-        // but retaining this call ensures idempotency if manual disk interventions occurred.
         Files.createDirectories(partitionDir);
 
-        // Write to a temporary .tmp file first and atomically move to .lz4 on close()
-        // so failed attempts never expose partial LZ4 frames to the ESS or Reducers.
-        Path tmpPath = partitionDir.resolve(mapTaskId + ".tmp");
+        Path tmpPath = resolveTmpPath(partitionDir);
         OutputStream os = Files.newOutputStream(tmpPath,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
         try {
-            LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os, BLOCKSIZE.SIZE_4MB);
+            BufferedOutputStream bos = new BufferedOutputStream(os, STREAM_BUFFER_BYTES);
+            LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(bos, BLOCKSIZE.SIZE_256KB);
             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8));
             writerCache.put(partitionIndex, writer);
             return writer;
@@ -170,49 +186,97 @@ public class ShufflePartitioner implements AutoCloseable {
         }
     }
 
+    private Path resolveTmpPath(Path partitionDir) {
+        return partitionDir.resolve(mapTaskId + ".attempt." + attemptId + ".tmp");
+    }
+
     /**
-     * Safely flushes and terminates all active LZ4 streams managed by this partitioner.
+     * Safely flushes, closes, and attempt-fences all active LZ4 partition streams.
      * <p>
-     * Essential for ensuring that all compressed frames are fully finalized on the local disk
-     * before the TaskExecutor signals a successful completion to the Orchestrator.
+     * When writes succeeded, checks {@code <mapTaskId>.attempt} in each partition directory:
+     * if an existing attempt integer is strictly greater than {@code this.attemptId}, logs a
+     * fencing drop warning and deletes the stale {@code .tmp} file without modifying
+     * {@code <mapTaskId>.lz4}. Otherwise atomically moves the {@code .tmp} file to
+     * {@code <mapTaskId>.lz4} and records {@code this.attemptId} in {@code <mapTaskId>.attempt}.
      * </p>
      */
     @Override
     public void close() {
-        logger.info("Finalizing LZ4 partition frames for task: {}", mapTaskId);
+        logger.info("Finalizing LZ4 partition frames for task: {} (attempt {})", mapTaskId, attemptId);
         for (Map.Entry<Integer, BufferedWriter> entry : writerCache.entrySet()) {
             int partitionIndex = entry.getKey();
             BufferedWriter writer = entry.getValue();
             Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
-            Path tmpPath = partitionDir.resolve(mapTaskId + ".tmp");
+            Path tmpPath = resolveTmpPath(partitionDir);
             Path finalPath = partitionDir.resolve(mapTaskId + ".lz4");
+            Path fencePath = partitionDir.resolve(mapTaskId + ".attempt");
             boolean finalized = false;
 
-            try {
-                if (!writeFailed) {
-                    writer.flush();
-                    writer.close();
-                    Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                    finalized = true;
-                } else {
-                    writer.close();
-                }
-            } catch (IOException e) {
-                logger.error("Failed to finalize shuffle stream for task {} partition {}", mapTaskId, partitionIndex, e);
+            synchronized (partitionLocks[partitionIndex]) {
                 try {
-                    writer.close();
-                } catch (IOException ignored) {
-                }
-            } finally {
-                if (!finalized) {
+                    if (!writeFailed) {
+                        writer.flush();
+                        writer.close();
+
+                        Integer existingFence = readFenceAttempt(fencePath);
+                        if (existingFence != null && existingFence > attemptId) {
+                            logger.warn("Fencing drop: partition {} for task {} already finalized by attempt {} (current stale attempt {}); discarding {}",
+                                    partitionIndex, mapTaskId, existingFence, attemptId, tmpPath.getFileName());
+                        } else {
+                            Files.move(tmpPath, finalPath,
+                                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                            writeFenceAttempt(partitionDir, fencePath, attemptId);
+                            finalized = true;
+                        }
+                    } else {
+                        writer.close();
+                    }
+                } catch (IOException e) {
+                    logger.error("Failed to finalize shuffle stream for task {} partition {} (attempt {})",
+                            mapTaskId, partitionIndex, attemptId, e);
                     try {
-                        Files.deleteIfExists(tmpPath);
-                    } catch (IOException deleteEx) {
-                        logger.warn("Failed to delete temporary shuffle file {}", tmpPath, deleteEx);
+                        writer.close();
+                    } catch (IOException ignored) {
+                    }
+                } finally {
+                    if (!finalized) {
+                        try {
+                            Files.deleteIfExists(tmpPath);
+                        } catch (IOException deleteEx) {
+                            logger.warn("Failed to delete temporary shuffle file {}", tmpPath, deleteEx);
+                        }
                     }
                 }
             }
         }
         writerCache.clear();
+    }
+
+    private Integer readFenceAttempt(Path fencePath) {
+        if (!Files.exists(fencePath)) {
+            return null;
+        }
+        try {
+            String raw = Files.readString(fencePath, StandardCharsets.UTF_8).trim();
+            if (raw.isEmpty()) {
+                return null;
+            }
+            return Integer.parseInt(raw);
+        } catch (Exception e) {
+            logger.warn("Corrupt or unreadable fence file {}; ignoring stale fence marker.", fencePath, e);
+            return null;
+        }
+    }
+
+    private void writeFenceAttempt(Path partitionDir, Path fencePath, int committedAttemptId) throws IOException {
+        Path fenceTmp = partitionDir.resolve(mapTaskId + ".attempt." + committedAttemptId + ".fence.tmp");
+        try {
+            Files.writeString(fenceTmp, String.valueOf(committedAttemptId), StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            Files.move(fenceTmp, fencePath,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(fenceTmp);
+        }
     }
 }

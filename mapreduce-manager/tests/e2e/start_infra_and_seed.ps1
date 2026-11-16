@@ -48,7 +48,8 @@ if (-not (Test-Path $CORE_CLASSES)) {
     mvn -f (Join-Path $NODE_ROOT "pom.xml") -pl mapreduce-core compile
 }
 
-$buildDir = Join-Path $env:TEMP "mr-e2e-classes"
+$tmpRoot = Join-Path $E2E_DIR ".tmp_e2e"
+$buildDir = Join-Path $tmpRoot "mr-e2e-classes"
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 javac --release 17 -cp $CORE_CLASSES -d $buildDir (Join-Path $FIXTURES_DIR "*.java")
 
@@ -56,7 +57,7 @@ javac --release 17 -cp $CORE_CLASSES -d $buildDir (Join-Path $FIXTURES_DIR "*.ja
 # 4. SEED MINIO BUCKETS VIA PORT-FORWARD
 # =============================================================================
 Write-Host "`n[INFO] Seeding MinIO buckets ('data', 'code', 'results', 'mapreduce-shuffle-overflow')..." -ForegroundColor Cyan
-$pf = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -WindowStyle Hidden
+$pf = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -NoNewWindow
 try {
     Start-Sleep -Seconds 3
     & $PYTHON_EXE -c @"
@@ -79,7 +80,7 @@ for name in os.listdir(build_dir):
     if ($pf -and -not $pf.HasExited) {
         Stop-Process -Id $pf.Id -Force
     }
-    Remove-Item -Recurse -Force $buildDir -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n[SUCCESS] Kubernetes infrastructure is Ready and MinIO is seeded!" -ForegroundColor Green

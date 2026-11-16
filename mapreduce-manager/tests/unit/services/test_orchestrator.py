@@ -20,6 +20,8 @@ import pytest
 from app.services.orchestrator import (
     calculate_chunks,
     calculate_reducers,
+    generate_chunk_splits,
+    get_chunk_split,
     get_optimal_worker_count,
     parse_s3_uri,
     validate_reducers,
@@ -159,3 +161,22 @@ def test_partitioning_boundaries(
     """
     mocker.patch("app.services.orchestrator.settings.CHUNK_SIZE_BYTES", 64 * 1024 * 1024)
     assert calculate_chunks(file_size) == expected_chunks
+
+
+def test_get_chunk_split_o1_bounds_and_parity(mocker: Any) -> None:
+    """
+    Verifies O(1) byte-offset math matches generate_chunk_splits and rejects out-of-bounds indices (ADR-05).
+    """
+    mocker.patch("app.services.orchestrator.settings.CHUNK_SIZE_BYTES", 100)
+    file_size = 250  # 3 chunks: (0, 100), (100, 100), (200, 50)
+
+    expected = list(generate_chunk_splits(file_size))
+    actual = [get_chunk_split(i, file_size) for i in range(len(expected))]
+    assert actual == expected == [(0, 100), (100, 100), (200, 50)]
+
+    with pytest.raises(ValueError):
+        get_chunk_split(-1, file_size)
+    with pytest.raises(ValueError):
+        get_chunk_split(3, file_size)
+    with pytest.raises(ValueError):
+        get_chunk_split(0, 0)

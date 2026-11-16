@@ -33,10 +33,10 @@ async def run_reconciliation_audit() -> None:
     """
     Performs a point-in-time audit of Redis reservations vs K8s reality.
 
-    Identifies 'Phantom Reservations' (jobs with reserved capacity but 0
-    active pods) and forcefully releases the locks to maintain cluster
-    availability. It relies on the CacheRepository for state fetching and
-    the centralized Lifecycle service for transaction safety.
+    Batches pod discovery into a single cluster-wide ``list_namespaced_pod`` call
+    (``label_selector="app=worker-node"``) grouped by ``labels["job_id"]`` (ADR-11)
+    instead of issuing O(J) per-job Kubernetes API requests. Identifies phantom
+    reservations with 0 active pods past the grace period and reclaims them.
     """
     redis_client = await get_redis_client()
     k8s_provider = await get_k8s_provider()
@@ -44,15 +44,18 @@ async def run_reconciliation_audit() -> None:
 
     # 1. Ask the DAL for active reservations (No raw Redis keys here)
     active_job_ids = await CacheRepository.get_active_job_reservations(redis_client)
+    if not active_job_ids:
+        return
+
+    # 2. Single batched K8s pod query grouped by labels["job_id"]
+    pod_counts_by_job = await client.get_active_pod_counts_by_job()
 
     for job_id in active_job_ids:
         try:
-            # 2. Query the source of truth (Kubernetes)
-            actual_pod_count = await client.get_active_pod_count(job_id)
+            actual_pod_count = pod_counts_by_job.get(job_id, 0)
 
-            # 3. If Redis claims capacity is used, but K8s is empty, check for grace period
+            # 3. If Redis claims capacity is used, but K8s has 0 pods, check grace period
             if actual_pod_count == 0:
-                # Ask the DAL for the elapsed time (No raw SQL here)
                 elapsed_seconds = await JobRepository.get_job_elapsed_time(job_id, db_pool)
 
                 # Only kill if the job hasn't updated its DB record in the last 60 seconds

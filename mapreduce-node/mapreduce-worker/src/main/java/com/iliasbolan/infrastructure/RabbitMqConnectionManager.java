@@ -42,7 +42,8 @@ public class RabbitMqConnectionManager {
      * Constructs a new {@code RabbitMqConnectionManager} with secure credentials.
      *
      * <p>Initializes the {@link ConnectionFactory} with the provided host and
-     * authentication identity to enable subsequent connection requests.</p>
+     * authentication identity, enabling automatic connection and topology recovery
+     * for resilient long-lived producer/consumer channels.</p>
      *
      * @param host     The hostname or IP address of the RabbitMQ broker.
      * @param username The authenticated username for the broker service.
@@ -53,8 +54,10 @@ public class RabbitMqConnectionManager {
         this.factory.setHost(host);
         this.factory.setUsername(username);
         this.factory.setPassword(password);
+        this.factory.setAutomaticRecoveryEnabled(true);
+        this.factory.setTopologyRecoveryEnabled(true);
 
-        logger.info("RabbitMqConnectionManager initialized securely for host: {}", host);
+        logger.info("RabbitMqConnectionManager initialized securely for host: {} (auto-recovery enabled)", host);
     }
 
     /**

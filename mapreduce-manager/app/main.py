@@ -25,7 +25,7 @@ from app.core.database import setup_database, teardown_database
 from app.core.logger import setup_logging
 from app.core.rabbitmq import setup_rabbitmq, teardown_rabbitmq
 from app.core.redis import setup_redis, teardown_redis
-from app.k8s.client import setup_k8s
+from app.k8s.client import setup_k8s, teardown_k8s
 from app.services.task_consumer import start_consumer
 from app.services.watchdog import start_watchdog
 from app.services.reconciler import reconciler_loop
@@ -119,6 +119,7 @@ async def lifespan(_: FastAPI):
                 logger.error("Error during background task shutdown: %s", str(e))
 
         # Step 3: Cleanly close infrastructure connections
+        await teardown_k8s()
         await teardown_rabbitmq()
         await teardown_redis()
         await teardown_database()

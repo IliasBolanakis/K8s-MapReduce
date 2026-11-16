@@ -1,14 +1,20 @@
 # IDE / Local Tooling
 .vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
 
-# Local-only architecture audit artifact
-ENTERPRISE_ARCHITECTURE_CRITIQUE.md
+# Local-only architecture audit & agent state artifacts
+ENTERPRISE_ARCHITECTURE_CRITIQUE*.md
 STATE.json
+_tmp_*
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
+venv/
 .pytest_cache/
 
 # Java / Maven / Gradle

@@ -16,10 +16,13 @@ from aio_pika.abc import AbstractRobustChannel
 from testcontainers.rabbitmq import RabbitMqContainer
 
 from app.core.rabbitmq import (
+    acquire_rabbitmq_channel,
+    declare_job_queues,
+    get_job_events_channel,
+    get_orchestration_events_channel,
     get_rabbitmq_channel,
     setup_rabbitmq,
     teardown_rabbitmq,
-    declare_job_queues,
 )
 
 # --- FIXTURES ---
@@ -113,23 +116,30 @@ async def test_rabbitmq_topology_declaration(mq_setup):
 
 
 @pytest.mark.asyncio
-async def test_singleton_channel_integrity(mq_setup):
+async def test_channel_pool_and_consumer_isolation(mq_setup):
     """
-    Verifies the distributed singleton pattern for AMQP channels.
+    Verifies ADR-13 isolated consumer channels and bounded publisher channel pool recovery.
 
-    Ensures that the application maintains a persistent, reusable channel
-    instance across multiple calls, reducing the overhead of TCP
-    handshakes and AMQP negotiation.
-
-    :param mq_setup: The RabbitMQ infrastructure setup fixture.
-    :type mq_setup: None
-    :return: None
-    :rtype: None
+    Ensures:
+    1. ``job_events_queue`` and ``orchestration_events_queue`` use distinct dedicated channels.
+    2. ``acquire_rabbitmq_channel`` leases healthy channels from the bounded pool and
+       transparently replaces a closed channel on return.
+    3. ``get_rabbitmq_channel`` returns healthy channels from the pool.
     """
-    ch1: AbstractRobustChannel = await get_rabbitmq_channel()
-    ch2: AbstractRobustChannel = await get_rabbitmq_channel()
+    job_ch = await get_job_events_channel()
+    orch_ch = await get_orchestration_events_channel()
+    assert job_ch is not orch_ch
+    assert not job_ch.is_closed
+    assert not orch_ch.is_closed
 
-    # Assert physical reference equality
-    assert ch1 is ch2
-    # Verify the channel is healthy and active
-    assert not ch1.is_closed
+    async with acquire_rabbitmq_channel() as ch:
+        assert not ch.is_closed
+        await ch.close()
+        assert ch.is_closed
+
+    # Next lease should receive an open, healthy replacement channel
+    async with acquire_rabbitmq_channel() as recovered_ch:
+        assert not recovered_ch.is_closed
+
+    rr_ch: AbstractRobustChannel = await get_rabbitmq_channel()
+    assert not rr_ch.is_closed

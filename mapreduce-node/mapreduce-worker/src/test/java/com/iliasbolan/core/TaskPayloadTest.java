@@ -89,5 +89,26 @@ class TaskPayloadTest {
 
         TaskPayload payload = new ObjectMapper().readValue(jsonPayload, TaskPayload.class);
         assertNull(payload.format());
+        assertEquals(0, payload.attemptId());
+    }
+
+    @Test
+    void testJsonDeserialization_MapsAttemptIdAndSupports16ArgConstructor() throws Exception {
+        String jsonPayload = """
+                {
+                    "jobId": "job-2026",
+                    "taskId": "0",
+                    "taskType": "REDUCE",
+                    "attemptId": 3
+                }
+                """;
+
+        TaskPayload payload = new ObjectMapper().readValue(jsonPayload, TaskPayload.class);
+        assertEquals(3, payload.attemptId());
+
+        TaskPayload legacy = new TaskPayload(
+                "job-1", "map-0", "tok", "MAP", "data", "in.txt",
+                0L, 1024L, 2, "code", "M.class", "M", null, null, List.of(), "TEXT");
+        assertEquals(0, legacy.attemptId());
     }
 }

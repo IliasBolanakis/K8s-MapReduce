@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The primary entry point for the standalone External Shuffle Service (ESS) Daemon.
@@ -36,11 +37,20 @@ import java.io.IOException;
  * Integrates an S3-compatible overflow tier. To maintain O(1) memory footprint and
  * optimize connection pooling, a single {@link MinioStorageService} instance is bootstrapped
  * and injected into both the background Garbage Collector and the gRPC data plane.
- * This guarantees fault tolerance against physical disk exhaustion without sacrificing data availability.
+ * When MinIO initialization fails, the daemon enters degraded local-only mode where
+ * {@link ShuffleServiceImpl} fails loud ({@code FAILED_PRECONDITION}) on missing local partitions.
+ * </p>
+ * <p>
+ * <b>Architecture Update 3: Ordered SIGTERM Drain (ADR-14)</b><br>
+ * The JVM shutdown hook drains components in strict dependency order:
+ * {@code server.shutdown()} &rarr; await gRPC server &amp; {@link ShuffleServiceImpl}
+ * {@code streamingPool} drain (&le;20s, escalating to {@code server.shutdownNow()} if needed)
+ * &rarr; {@link StorageJanitor#stop()} (completing any active spill/GC cycle cleanly)
+ * &rarr; {@link MinioStorageService#close()} (draining the shared global S3 transfer pool).
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
+ * @version 4.0
  * @since 2026-05-13
  * @see com.iliasbolan.ess.gc.StorageJanitor
  * @see com.iliasbolan.ess.grpc.ShuffleServiceImpl
@@ -49,6 +59,9 @@ import java.io.IOException;
 public class ShuffleDaemon {
 
     private static final Logger logger = LoggerFactory.getLogger(ShuffleDaemon.class);
+
+    /** Default shutdown drain budget (in seconds) for gRPC server and active streams. */
+    public static final long DEFAULT_DRAIN_TIMEOUT_SECONDS = 20L;
 
     /**
      * Thread-local gRPC Context Key used to propagate the authorization token securely
@@ -64,11 +77,11 @@ public class ShuffleDaemon {
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
 
     /**
-     * Bootstraps the ESS Daemon, initializes multi-tier storage maintenance, and activates
-     * the secure gRPC server.
+     * Bootstraps the ESS Daemon, initializes multi-tier storage maintenance, activates
+     * the secure gRPC server, and registers an ordered {@code SIGTERM} shutdown hook.
      *
      * @param args Command line arguments (Configuration is derived from Environment Variables).
-     * @throws IOException If the gRPC server fails to bind or physical storage is inaccessible.
+     * @throws IOException          If the gRPC server fails to bind or physical storage is inaccessible.
      * @throws InterruptedException If the server process is interrupted while running.
      */
     public static void main(String[] args) throws IOException, InterruptedException {
@@ -86,8 +99,8 @@ public class ShuffleDaemon {
             minioStorageService = new MinioStorageService();
             logger.info("MinIO Overflow Tier successfully integrated.");
         } catch (Exception e) {
-            logger.error("Failed to connect to MinIO cluster. Proceeding with Local-Only mode. WARNING: Data loss may occur upon disk exhaustion!", e);
-            // By catching and not throwing, the ESS degrades gracefully into a local-only node if S3 is down.
+            logger.error("Failed to connect to MinIO cluster. Proceeding with Local-Only mode. WARNING: Missing local partitions will fail with FAILED_PRECONDITION!", e);
+            // By catching and not throwing, the ESS runs in degraded local-only mode if S3 is down.
         }
 
         // 3. Initialize the Storage Maintenance Service
@@ -114,23 +127,78 @@ public class ShuffleDaemon {
 
         // 5. Configure and start the gRPC Service Plane
         // We inject the storage service to enable Lazy-Restoration of spilled data.
+        final ShuffleServiceImpl shuffleService = new ShuffleServiceImpl(baseShuffleDir, minioStorageService);
+        final MinioStorageService sharedMinioService = minioStorageService;
+
         Server server = ServerBuilder.forPort(port)
-                .addService(new ShuffleServiceImpl(baseShuffleDir, minioStorageService))
+                .addService(shuffleService)
                 .intercept(authInterceptor)
                 .build();
 
         server.start();
         logger.info("ESS Daemon successfully bound. Secure Interceptor & Overflow Routing ACTIVE.");
 
-        // 6. Graceful Teardown hook
-        // Ensures that physical storage managers and active streams are closed before process termination.
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            logger.warn("Shutdown signal received. Terminating ESS Daemon...");
-            server.shutdown();
-            StorageJanitor.stop();
-        }));
+        // 6. Ordered Graceful Teardown hook (ADR-14)
+        // Ensures active streams drain, Janitor finishes in-flight spills, and S3 pool closes in strict order.
+        Runtime.getRuntime().addShutdownHook(new Thread(
+                () -> shutdownSequence(server, shuffleService, sharedMinioService, DEFAULT_DRAIN_TIMEOUT_SECONDS),
+                "ess-shutdown-hook"
+        ));
 
         // Block the main thread until the server is shut down
         server.awaitTermination();
+    }
+
+    /**
+     * Executes the ordered {@code SIGTERM} drain sequence across all ESS subsystems:
+     * <ol>
+     *   <li>Stop accepting new RPCs via {@link Server#shutdown()} and await termination up to
+     *   {@code drainTimeoutSeconds}, escalating to {@link Server#shutdownNow()} if stalled.</li>
+     *   <li>Drain {@link ShuffleServiceImpl#shutdownAndAwait(long, TimeUnit)} so active
+     *   virtual-thread streams release leases, permits, and pooled Direct ByteBuffers.</li>
+     *   <li>Stop {@link StorageJanitor#stop()} cleanly after any in-flight spill/GC cycle.</li>
+     *   <li>Close {@link MinioStorageService#close()} to drain the global S3 transfer pool.</li>
+     * </ol>
+     *
+     * @param server              The running gRPC server (may be {@code null}).
+     * @param shuffleService      The gRPC data-plane service instance (may be {@code null}).
+     * @param minioStorageService The shared MinIO overflow adapter (may be {@code null}).
+     * @param drainTimeoutSeconds Maximum seconds to await gRPC server and stream drain.
+     */
+    public static void shutdownSequence(Server server,
+                                        ShuffleServiceImpl shuffleService,
+                                        MinioStorageService minioStorageService,
+                                        long drainTimeoutSeconds) {
+        logger.warn("Shutdown signal received. Executing ordered ESS Daemon drain...");
+        long timeoutSecs = Math.max(1L, drainTimeoutSeconds);
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSecs);
+
+        if (server != null) {
+            server.shutdown();
+            try {
+                if (!server.awaitTermination(timeoutSecs, TimeUnit.SECONDS)) {
+                    logger.warn("gRPC server did not terminate within {}s; escalating to server.shutdownNow().", timeoutSecs);
+                    server.shutdownNow();
+                    server.awaitTermination(2, TimeUnit.SECONDS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("Interrupted while awaiting gRPC server termination; forcing server.shutdownNow().");
+                server.shutdownNow();
+            }
+        }
+
+        if (shuffleService != null) {
+            long minFloorMs = TimeUnit.SECONDS.toMillis(Math.min(2L, timeoutSecs));
+            long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+            shuffleService.shutdownAndAwait(Math.max(minFloorMs, remainingMs), TimeUnit.MILLISECONDS);
+        }
+
+        StorageJanitor.stop();
+
+        if (minioStorageService != null) {
+            minioStorageService.close();
+        }
+        logger.info("ESS Daemon ordered shutdown complete.");
     }
 }

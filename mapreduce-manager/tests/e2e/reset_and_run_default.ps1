@@ -56,8 +56,8 @@ kubectl rollout status daemonset/external-shuffle-service -n $K8S_NAMESPACE --ti
 # 4. SEED SAMPLE DATASET & EXECUTE WORDCOUNT JOB
 # =============================================================================
 Write-Host "`n[INFO] Phase 3: Seeding sample dataset and submitting WordCount job..." -ForegroundColor Cyan
-$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -WindowStyle Hidden
-$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -WindowStyle Hidden
+$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -NoNewWindow
+$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -NoNewWindow
 
 try {
     Start-Sleep -Seconds 3

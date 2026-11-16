@@ -11,11 +11,14 @@ import com.rabbitmq.client.Envelope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -164,13 +167,14 @@ class RabbitMqConsumerTest {
 
         internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
 
-        // Verify error signaling includes diagnostic information and the auth token
+        // Verify error signaling includes diagnostic information, auth token, and attemptId
         verify(mockEventProducer).sendErrorSignal(
                 eq("job-002"),
                 eq("map-1"),
                 eq("token-456"),
                 eq("FAILED"),
-                eq("RuntimeException")
+                eq("RuntimeException"),
+                eq(0)
         );
 
         // Verify Manager owns retries: Node NACKs (requeue=false) and never republishes or ACKs
@@ -188,7 +192,7 @@ class RabbitMqConsumerTest {
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
         doThrow(new RuntimeException("Task Error")).when(mockTaskExecutor).executeTask(anyString());
         doThrow(new RuntimeException("Event Queue Down")).when(mockEventProducer)
-                .sendErrorSignal(anyString(), anyString(), anyString(), anyString(), anyString());
+                .sendErrorSignal(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt());
 
         Thread consumerThread = new Thread(() -> {
             try { consumer.startConsuming(); } catch (Exception ignored) {}
@@ -239,7 +243,7 @@ class RabbitMqConsumerTest {
 
         long deliveryTag = 8888L;
         Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
-        byte[] body = "{\"jobId\":\"poison-pill\", \"taskId\":\"map-2\", \"jobToken\":\"token-789\"}"
+        byte[] body = "{\"jobId\":\"poison-pill\", \"taskId\":\"map-2\", \"jobToken\":\"token-789\", \"attemptId\":3}"
                 .getBytes(StandardCharsets.UTF_8);
 
         // --- FIX: Inject the NEW custom header instead of the old quorum queue header ---
@@ -253,13 +257,14 @@ class RabbitMqConsumerTest {
         // Verify NACK with requeue=false to discard the poison pill to the DLX
         verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
 
-        // Verify terminal failure signal
+        // Verify terminal failure signal includes attemptId
         verify(mockEventProducer).sendErrorSignal(
                 eq("poison-pill"),
                 eq("map-2"),
                 eq("token-789"),
                 eq("FAILED"),
-                eq("MAX_RETRIES_EXCEEDED")
+                eq("MAX_RETRIES_EXCEEDED"),
+                eq(3)
         );
 
         // Ensure the engine was never invoked for a poison pill
@@ -267,5 +272,99 @@ class RabbitMqConsumerTest {
 
         consumer.stopConsuming();
         consumerThread.join();
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testSinglePartitionMode_ExitsImmediatelyAfterAckWithoutIdleWait() throws Throwable {
+        when(mockChannel.basicConsume(eq("reduce_tasks_job-1_0"), eq(false), any(DeliverCallback.class), any(CancelCallback.class)))
+                .thenReturn("ctag-0");
+
+        RabbitMqConsumer consumer = new RabbitMqConsumer(
+                mockManager, "reduce_tasks_job-1_0", 10_000, mockTaskExecutor, mockEventProducer, true);
+
+        Thread consumerThread = new Thread(() -> {
+            try { consumer.startConsuming(); } catch (Exception ignored) {}
+        });
+        long startMs = System.currentTimeMillis();
+        consumerThread.start();
+        Thread.sleep(150);
+
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
+        verify(mockChannel).basicConsume(eq("reduce_tasks_job-1_0"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
+
+        long deliveryTag = 501L;
+        Envelope envelope = new Envelope(deliveryTag, false, "ex", "rk");
+        byte[] body = "{\"jobId\":\"job-1\", \"taskId\":\"0\", \"jobToken\":\"tok\", \"taskType\":\"REDUCE\", \"attemptId\":2}"
+                .getBytes(StandardCharsets.UTF_8);
+
+        callbackCaptor.getValue().handle("ctag-0", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
+
+        consumerThread.join(2000);
+        long elapsedMs = System.currentTimeMillis() - startMs;
+
+        assertFalse(consumerThread.isAlive(), "Single-partition consumer must exit right after ACK");
+        assertTrue(elapsedMs < 3000, "Must exit well before 10s IDLE_TIMEOUT_MILLIS, took: " + elapsedMs + "ms");
+        verify(mockChannel).basicAck(deliveryTag, false);
+        verify(mockChannel).basicCancel("ctag-0");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testGracefulDrain_PreemptsStuckTaskAndNacksWithRequeueTrueBeforeChannelClose() throws Throwable {
+        when(mockChannel.basicConsume(eq("map_tasks_job-drain"), eq(false), any(DeliverCallback.class), any(CancelCallback.class)))
+                .thenReturn("ctag-drain");
+
+        CountDownLatch taskStarted = new CountDownLatch(1);
+        CountDownLatch allowTaskThrow = new CountDownLatch(1);
+
+        doAnswer(inv -> {
+            taskStarted.countDown();
+            allowTaskThrow.await(5, TimeUnit.SECONDS);
+            throw new InterruptedException("Preempted");
+        }).when(mockTaskExecutor).executeTask(anyString());
+
+        when(mockTaskExecutor.isPreempted()).thenReturn(true);
+        doAnswer(inv -> {
+            allowTaskThrow.countDown();
+            return null;
+        }).when(mockTaskExecutor).preemptActiveTask(50L);
+
+        RabbitMqConsumer consumer = new RabbitMqConsumer(
+                mockManager, "map_tasks_job-drain", 10_000, mockTaskExecutor, mockEventProducer, false);
+
+        Thread consumerThread = new Thread(() -> {
+            try { consumer.startConsuming(); } catch (Exception ignored) {}
+        });
+        consumerThread.start();
+        Thread.sleep(150);
+
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
+        verify(mockChannel).basicConsume(eq("map_tasks_job-drain"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
+
+        long deliveryTag = 777L;
+        Envelope envelope = new Envelope(deliveryTag, false, "ex", "rk");
+        byte[] body = "{\"jobId\":\"job-drain\", \"taskId\":\"map-0\", \"jobToken\":\"tok\", \"taskType\":\"MAP\", \"attemptId\":2}"
+                .getBytes(StandardCharsets.UTF_8);
+
+        Thread deliveryThread = new Thread(() -> {
+            try {
+                callbackCaptor.getValue().handle("ctag-drain", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
+            } catch (Exception ignored) {}
+        });
+        deliveryThread.start();
+        assertTrue(taskStarted.await(2, TimeUnit.SECONDS));
+
+        consumer.initiateGracefulDrain(50L, 50L);
+        deliveryThread.join(2000);
+        consumerThread.join(2000);
+
+        InOrder inOrder = inOrder(mockChannel, mockTaskExecutor);
+        inOrder.verify(mockChannel).basicCancel("ctag-drain");
+        inOrder.verify(mockTaskExecutor).preemptActiveTask(50L);
+        inOrder.verify(mockChannel).basicNack(deliveryTag, false, true);
+        inOrder.verify(mockChannel).close();
+
+        verify(mockEventProducer, never()).sendErrorSignal(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt());
     }
 }

@@ -9,9 +9,16 @@ metadata:
     phase: "{{ PHASE }}"
     tier: compute
 spec:
+  {% if INDEXED %}
+  completionMode: Indexed
   parallelism: {{ REPLICAS }}
-  completions: {{ REPLICAS }}
+  completions: {{ COMPLETIONS }}
+  backoffLimitPerIndex: 3
+  {% else %}
+  parallelism: {{ REPLICAS }}
+  completions: {{ COMPLETIONS | default(REPLICAS) }}
   backoffLimit: 4 # Number of retries before marking the job as failed
+  {% endif %}
   template:
     metadata:
       labels:
@@ -66,12 +73,20 @@ spec:
           # 2. MaxDirectMemorySize=256m strictly caps off-heap NIO allocations during shuffle
           #    fetches to prevent the K8s container from hitting OOMKilled over the 2Gi limit.
           - name: JAVA_OPTS
-            value: "-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m"
+            value: "-Xms128m -Xmx256m -XX:+UseParallelGC -XX:MaxDirectMemorySize=128m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
 
           - name: RABBITMQ_HOST
             value: "{{ RABBITMQ_HOST }}"
           - name: RABBITMQ_QUEUE
+            {% if PARTITION_ID is defined and PARTITION_ID is not none %}
+            value: "{{ PHASE }}_tasks_{{ JOB_ID }}_{{ PARTITION_ID }}"
+            {% else %}
             value: "{{ PHASE }}_tasks_{{ JOB_ID }}"
+            {% endif %}
+          {% if PARTITION_ID is defined and PARTITION_ID is not none %}
+          - name: PARTITION_ID
+            value: "{{ PARTITION_ID }}"
+          {% endif %}
           - name: EVENT_QUEUE
             value: "job_events_queue"
 
@@ -122,5 +137,5 @@ spec:
           path: /var/lib/mapreduce/shuffle-data
           type: DirectoryOrCreate
 
-      restartPolicy: OnFailure
-      terminationGracePeriodSeconds: 30
+      restartPolicy: {{ "Never" if INDEXED else "OnFailure" }}
+      terminationGracePeriodSeconds: 40

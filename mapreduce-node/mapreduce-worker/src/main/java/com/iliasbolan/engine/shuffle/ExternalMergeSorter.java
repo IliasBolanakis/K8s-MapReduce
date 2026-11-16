@@ -3,70 +3,130 @@ package com.iliasbolan.engine.shuffle;
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Reducer;
 import net.jpountz.lz4.LZ4FrameOutputStream;
+import net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE;
 import org.apache.commons.compress.compressors.lz4.FramedLZ4CompressorInputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.PriorityQueue;
 import java.util.stream.Stream;
 
 /**
  * Enterprise-grade external merge sort utility for distributed data processing.
  * <p>
- * This engine guarantees stable memory consumption (O(1) memory footprint during reduction)
- * regardless of data skew or absolute partition size. It achieves this by lazily streaming
- * decompressed blocks from disk directly to the user-defined reduction logic.
- * </p>
- * <p>
- * <b>Architectural Update: Fault-Tolerant Concatenated LZ4 Ingestion</b><br>
- * Safely handles complex distributed edge cases during the gRPC fetch phase:
+ * Guarantees bounded heap memory and bounded file-descriptor usage during reduction by:
  * <ul>
- * <li><b>Concatenated Frame Native Support:</b> The ESS transmits data by appending multiple LZ4 frames
- * into a single unified stream. Standard `lz4-java` inputs drop bytes across frame boundaries.
- * This has been migrated to Apache Commons Compress, which natively decompresses concatenated
- * frames via the {@code decompressConcatenated} flag, ensuring zero data loss.</li>
- * <li><b>Empty Stream Guard:</b> Explicitly verifies file sizes to prevent fatal magic-number
- * mismatch exceptions on 0-byte payloads caused by natural data skew.</li>
- * <li><b>Atomic Move Compatibility:</b> Strictly filters for {@code .lz4} extensions,
- * ignoring transient {@code .tmp} files generated during active gRPC fetches.</li>
+ * <li><b>JVM Object-Overhead Accounting:</b> Estimates each buffered {@link KeyValuePair} at
+ * {@code 96 + 2 * (key.length() + value.length())} bytes so heap spills trigger accurately
+ * before GC thrashing or OOMKills.</li>
+ * <li><b>Bounded Multi-Pass Merge ({@code K = 64}):</b> Caps simultaneous open run readers at
+ * {@link #MAX_MERGE_FAN_IN} ({@code 64}). When more than {@code K} sorted runs exist on disk,
+ * multi-pass intermediate merges fold up to {@code K} runs at a time into new 256KB-block LZ4
+ * runs, eagerly deleting consumed input runs after each pass until {@code <= K} runs remain.</li>
+ * <li><b>Concatenated LZ4 Frame Ingestion:</b> Uses Apache Commons Compress with
+ * {@code decompressConcatenated = true} and skips 0-byte skew files safely.</li>
  * </ul>
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 4.4
+ * @version 5.0
  * @since 2026-05-12
  */
 public class ExternalMergeSorter {
 
     private static final Logger logger = LoggerFactory.getLogger(ExternalMergeSorter.class);
 
-    /** Safe memory boundary for in-memory chunking before spilling to disk. */
-    private static final int CHUNK_RECORD_LIMIT = 500_000;
+    /** Maximum number of records buffered in memory before spilling a sorted run. */
+    static final int DEFAULT_CHUNK_RECORD_LIMIT = 500_000;
+
+    /** Maximum estimated JVM heap bytes per buffered chunk before spilling a sorted run (32 MiB). */
+    static final long DEFAULT_MAX_CHUNK_SIZE_BYTES = 32L * 1024 * 1024;
+
+    /** Maximum number of simultaneous open run readers allowed in any merge pass. */
+    public static final int MAX_MERGE_FAN_IN = 64;
+
+    /** Buffer size (64KB) wrapping intermediate LZ4 run writers. */
+    static final int LZ4_BUFFER_SIZE_BYTES = 64 * 1024;
+
+    /** Fixed JVM object + String/List overhead bytes assumed per {@link KeyValuePair}. */
+    static final long RECORD_JVM_OVERHEAD_BYTES = 96L;
 
     /**
-     * Orchestrates the complete Spill-to-Disk sort and reduce pipeline.
+     * Orchestrates the complete Spill-to-Disk multi-pass sort and reduce pipeline
+     * using production defaults ({@code 500,000} records, {@code 32 MiB} heap accounting,
+     * {@code K = 64} fan-in).
      *
      * @param rawDataDir The local directory containing the raw, LZ4-compressed gRPC stream files.
-     * @param reducer    The user-defined Reducer implementation dynamically loaded into the JVM.
+     * @param reducer    The user-defined {@link Reducer} implementation dynamically loaded into the JVM.
      * @return The {@link Path} to the final serialized file containing the reduced output.
      * @throws IOException If a fatal disk I/O failure occurs during merging or resource allocation.
      */
     public static Path sortReduceAndSpill(Path rawDataDir, Reducer reducer) throws IOException {
-        logger.info("Initializing LZ4-Aware ExternalMergeSorter on directory: {}", rawDataDir);
+        return sortReduceAndSpill(
+                rawDataDir,
+                reducer,
+                DEFAULT_CHUNK_RECORD_LIMIT,
+                DEFAULT_MAX_CHUNK_SIZE_BYTES,
+                MAX_MERGE_FAN_IN
+        );
+    }
+
+    /**
+     * Orchestrates the Spill-to-Disk multi-pass sort and reduce pipeline with explicit
+     * spill thresholds and merge fan-in bounds (exposed for deterministic unit testing).
+     *
+     * @param rawDataDir        The local directory containing raw {@code grpc_stream_*.lz4} files.
+     * @param reducer           The user-defined {@link Reducer} implementation.
+     * @param chunkRecordLimit  Maximum records per in-memory run chunk.
+     * @param maxChunkSizeBytes Maximum estimated JVM heap bytes per in-memory run chunk.
+     * @param maxMergeFanIn     Maximum simultaneous open run readers ({@code >= 2}, {@code 64} in production).
+     * @return The {@link Path} to {@code final_reduced_output.txt}.
+     * @throws IOException              If disk I/O fails during sorting, merging, or reducing.
+     * @throws IllegalArgumentException If {@code maxMergeFanIn < 2}, {@code chunkRecordLimit < 1}, or {@code maxChunkSizeBytes < 1}.
+     */
+    static Path sortReduceAndSpill(Path rawDataDir,
+                                   Reducer reducer,
+                                   int chunkRecordLimit,
+                                   long maxChunkSizeBytes,
+                                   int maxMergeFanIn) throws IOException {
+        if (maxMergeFanIn < 2) {
+            throw new IllegalArgumentException("maxMergeFanIn must be >= 2, got: " + maxMergeFanIn);
+        }
+        if (chunkRecordLimit < 1 || maxChunkSizeBytes < 1) {
+            throw new IllegalArgumentException("Spill thresholds must be positive.");
+        }
+
+        logger.info("Initializing LZ4-Aware ExternalMergeSorter on directory: {} (maxFanIn={})",
+                rawDataDir, maxMergeFanIn);
 
         Path runsDir = rawDataDir.resolve("sorted_runs");
         Files.createDirectories(runsDir);
 
-        // Phase 1: Ingest, decompress, sort, and re-compress intermediate runs
-        List<Path> sortedRuns = createSortedRuns(rawDataDir, runsDir);
-        logger.info("Generated {} compressed sorted runs on disk. Commencing Lazy K-Way Merge...", sortedRuns.size());
+        List<Path> sortedRuns = createSortedRuns(rawDataDir, runsDir, chunkRecordLimit, maxChunkSizeBytes);
+        logger.info("Generated {} compressed sorted runs on disk.", sortedRuns.size());
 
-        // Phase 2: K-Way Merge and Execute Reduce
+        if (sortedRuns.size() > maxMergeFanIn) {
+            sortedRuns = reduceRunsToFanIn(sortedRuns, runsDir, maxMergeFanIn);
+        }
+
+        logger.info("Commencing final streaming {}-way merge and reduce.", sortedRuns.size());
         Path finalOutputFile = rawDataDir.resolve("final_reduced_output.txt");
         performNWayMergeAndReduce(sortedRuns, finalOutputFile, reducer);
 
@@ -74,58 +134,71 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Reads concatenated input files and spills sorted, compressed chunks to the local file system.
+     * Estimates the JVM heap footprint of a single {@link KeyValuePair}, accounting for
+     * object headers, {@link String} metadata, array references, and UTF-16 character storage.
      *
-     * @param rawDataDir The directory containing raw gRPC stream files.
-     * @param runsDir    The directory where sorted chunk files will be persisted.
-     * @return A {@link List} of {@link Path} objects identifying the generated sorted runs.
-     * @throws IOException If fatal disk I/O failures occur while reading streams or spilling runs.
+     * @param pair The key-value pair to account for.
+     * @return Estimated heap bytes ({@code 96 + 2 * (key.length() + value.length())}).
      */
-    private static List<Path> createSortedRuns(Path rawDataDir, Path runsDir) throws IOException {
-        List<Path> sortedRunFiles = new ArrayList<>();
-        List<KeyValuePair> currentChunk = new ArrayList<>(CHUNK_RECORD_LIMIT);
+    static long estimateRecordMemoryBytes(KeyValuePair pair) {
+        return RECORD_JVM_OVERHEAD_BYTES + 2L * (pair.key().length() + pair.value().length());
+    }
 
-        long currentChunkSizeBytes = 0;
-        final long MAX_CHUNK_SIZE_BYTES = 32 * 1024 * 1024; // 32MB physical memory limit per chunk
+    /**
+     * Reads concatenated input files and spills sorted, 256KB-block LZ4-compressed chunks to disk.
+     *
+     * @param rawDataDir        The directory containing raw gRPC stream files.
+     * @param runsDir           The directory where sorted chunk files will be persisted.
+     * @param chunkRecordLimit  Maximum records per run chunk.
+     * @param maxChunkSizeBytes Maximum estimated JVM memory bytes per run chunk.
+     * @return A {@link List} of {@link Path} objects identifying the generated sorted runs.
+     * @throws IOException If disk I/O failures occur while reading streams or spilling runs.
+     */
+    private static List<Path> createSortedRuns(Path rawDataDir,
+                                               Path runsDir,
+                                               int chunkRecordLimit,
+                                               long maxChunkSizeBytes) throws IOException {
+        List<Path> sortedRunFiles = new ArrayList<>();
+        List<KeyValuePair> currentChunk = new ArrayList<>(Math.min(chunkRecordLimit, 1024));
+
+        long currentChunkSizeBytes = 0L;
         int runCounter = 0;
 
         try (Stream<Path> rawFiles = Files.list(rawDataDir)) {
-            // Strictly require .lz4 extension to avoid reading active .tmp fetches
             List<Path> filesToProcess = rawFiles
                     .filter(p -> p.getFileName().toString().startsWith("grpc_stream_") && p.toString().endsWith(".lz4"))
+                    .sorted()
                     .toList();
 
             for (Path rawFile : filesToProcess) {
-
-                // EMPTY-STREAM GUARD: Skip 0-byte files resulting from data skew
                 if (Files.size(rawFile) == 0) {
                     logger.debug("Skipping 0-byte gRPC stream file: {}", rawFile.getFileName());
                     continue;
                 }
 
-                // Use Apache Commons with 'decompressConcatenated = true'
-                // This eliminates the Buffer Over-Read vulnerability that previously destroyed boundaries.
                 try (InputStream is = Files.newInputStream(rawFile);
                      FramedLZ4CompressorInputStream lz4is = new FramedLZ4CompressorInputStream(is, true);
                      BufferedReader reader = new BufferedReader(new InputStreamReader(lz4is, StandardCharsets.UTF_8))) {
 
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        if (line.isBlank()) continue;
+                        if (line.isBlank()) {
+                            continue;
+                        }
 
                         int tabIndex = line.indexOf('\t');
                         if (tabIndex > 0) {
                             String key = line.substring(0, tabIndex);
                             String value = line.substring(tabIndex + 1);
-                            currentChunk.add(new KeyValuePair(key, value));
-                            currentChunkSizeBytes += key.length() + value.length() + 2;
+                            KeyValuePair pair = new KeyValuePair(key, value);
+                            currentChunk.add(pair);
+                            currentChunkSizeBytes += estimateRecordMemoryBytes(pair);
                         }
 
-                        // Flush if EITHER the record count OR the physical byte limit is breached
-                        if (currentChunk.size() >= CHUNK_RECORD_LIMIT || currentChunkSizeBytes >= MAX_CHUNK_SIZE_BYTES) {
+                        if (currentChunk.size() >= chunkRecordLimit || currentChunkSizeBytes >= maxChunkSizeBytes) {
                             sortedRunFiles.add(sortAndSpillChunk(currentChunk, runsDir, runCounter++));
                             currentChunk.clear();
-                            currentChunkSizeBytes = 0;
+                            currentChunkSizeBytes = 0L;
                         }
                     }
                 }
@@ -139,7 +212,103 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Sorts an in-memory chunk and persists it to disk using LZ4 frame compression.
+     * Iteratively folds sorted runs in batches of at most {@code maxMergeFanIn} until
+     * {@code <= maxMergeFanIn} runs remain, eagerly deleting consumed input runs after each pass.
+     *
+     * @param sortedRuns    Initial list of sorted run files on disk.
+     * @param runsDir       Working directory for intermediate merged runs.
+     * @param maxMergeFanIn Maximum simultaneous open run readers per merge batch.
+     * @return The reduced list of {@code <= maxMergeFanIn} sorted run files.
+     * @throws IOException If merging or deleting consumed run files fails.
+     */
+    private static List<Path> reduceRunsToFanIn(List<Path> sortedRuns, Path runsDir, int maxMergeFanIn) throws IOException {
+        List<Path> currentRuns = new ArrayList<>(sortedRuns);
+        int passNumber = 1;
+
+        while (currentRuns.size() > maxMergeFanIn) {
+            List<Path> nextPassRuns = new ArrayList<>();
+            int batchIndex = 0;
+
+            for (int i = 0; i < currentRuns.size(); i += maxMergeFanIn) {
+                int end = Math.min(i + maxMergeFanIn, currentRuns.size());
+                List<Path> batch = currentRuns.subList(i, end);
+
+                if (batch.size() == 1) {
+                    nextPassRuns.add(batch.get(0));
+                } else {
+                    Path mergedRun = runsDir.resolve("merge_pass_" + passNumber + "_batch_" + (batchIndex++) + ".lz4");
+                    mergeSortedRunBatch(batch, mergedRun);
+                    for (Path consumedRun : batch) {
+                        Files.deleteIfExists(consumedRun);
+                    }
+                    nextPassRuns.add(mergedRun);
+                }
+            }
+
+            logger.info("External merge pass {} complete: compacted {} runs into {} runs (maxFanIn={}).",
+                    passNumber, currentRuns.size(), nextPassRuns.size(), maxMergeFanIn);
+            currentRuns = nextPassRuns;
+            passNumber++;
+        }
+
+        return currentRuns;
+    }
+
+    /**
+     * Merges a bounded batch of sorted LZ4 run files into a single sorted 256KB-block LZ4 run file.
+     *
+     * @param batch     The bounded batch of sorted input run files ({@code <= maxMergeFanIn}).
+     * @param outputRun Destination path for the merged intermediate run file.
+     * @throws IOException If reading input runs or writing the merged run fails.
+     */
+    private static void mergeSortedRunBatch(List<Path> batch, Path outputRun) throws IOException {
+        PriorityQueue<StreamNode> pq = new PriorityQueue<>();
+        List<BufferedReader> activeReaders = new ArrayList<>(batch.size());
+
+        try (OutputStream os = Files.newOutputStream(outputRun, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+             BufferedOutputStream bos = new BufferedOutputStream(os, LZ4_BUFFER_SIZE_BYTES);
+             LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(bos, BLOCKSIZE.SIZE_256KB);
+             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8))) {
+
+            for (Path runFile : batch) {
+                if (Files.size(runFile) == 0) {
+                    continue;
+                }
+                InputStream is = Files.newInputStream(runFile);
+                FramedLZ4CompressorInputStream lz4is = new FramedLZ4CompressorInputStream(is, true);
+                BufferedReader reader = new BufferedReader(new InputStreamReader(lz4is, StandardCharsets.UTF_8));
+                activeReaders.add(reader);
+
+                StreamNode node = new StreamNode(reader);
+                if (node.advance()) {
+                    pq.add(node);
+                }
+            }
+
+            while (!pq.isEmpty()) {
+                StreamNode minNode = pq.poll();
+                writer.write(minNode.currentKey);
+                writer.write('\t');
+                writer.write(minNode.currentValue);
+                writer.write('\n');
+
+                if (minNode.advance()) {
+                    pq.add(minNode);
+                }
+            }
+        } finally {
+            for (BufferedReader reader : activeReaders) {
+                try {
+                    reader.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Sorts an in-memory chunk and persists it to disk using 256KB-block LZ4 frame compression
+     * over a 64KB {@link BufferedOutputStream}.
      *
      * @param chunk   The collection of records currently loaded in memory.
      * @param runsDir The destination directory for the sorted file.
@@ -153,11 +322,11 @@ public class ExternalMergeSorter {
         Path runFile = runsDir.resolve("run_" + runId + ".lz4");
 
         try (OutputStream os = Files.newOutputStream(runFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-             LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os);
+             BufferedOutputStream bos = new BufferedOutputStream(os, LZ4_BUFFER_SIZE_BYTES);
+             LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(bos, BLOCKSIZE.SIZE_256KB);
              BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8))) {
 
             for (KeyValuePair pair : chunk) {
-                // PERFORMANCE OPTIMIZATION: Eliminate ephemeral StringBuilders
                 writer.write(pair.key());
                 writer.write('\t');
                 writer.write(pair.value());
@@ -169,10 +338,10 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Merges multiple compressed sorted runs and streams grouped keys lazily to the user-defined Reducer.
+     * Merges up to {@code K} compressed sorted runs and streams grouped keys lazily to the user-defined {@link Reducer}.
      *
-     * @param sortedRuns The collection of compressed sorted run files to be merged.
-     * @param outputFile The destination file for the final reduced results (Standard text).
+     * @param sortedRuns The bounded collection of compressed sorted run files to be merged.
+     * @param outputFile The destination file for the final reduced results.
      * @param reducer    The user-defined aggregation logic.
      * @throws IOException If disk I/O failures occur during merging or reducing.
      */
@@ -183,8 +352,10 @@ public class ExternalMergeSorter {
         try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
             for (Path runFile : sortedRuns) {
+                if (Files.size(runFile) == 0) {
+                    continue;
+                }
                 InputStream is = Files.newInputStream(runFile);
-                // CONSISTENCY FIX: Apply Apache Commons decompressor to run files as well
                 FramedLZ4CompressorInputStream lz4is = new FramedLZ4CompressorInputStream(is, true);
                 BufferedReader reader = new BufferedReader(new InputStreamReader(lz4is, StandardCharsets.UTF_8));
 
@@ -202,7 +373,6 @@ public class ExternalMergeSorter {
 
                 executeReduceAndWrite(currentGroupingKey, lazyIterator, reducer, writer);
 
-                // Safety Guard: Manually drain the iterator if the Reducer returns early
                 while (lazyIterator.hasNext()) {
                     lazyIterator.next();
                 }
@@ -210,13 +380,17 @@ public class ExternalMergeSorter {
 
         } finally {
             for (BufferedReader reader : activeReaders) {
-                try { reader.close(); } catch (IOException ignored) {}
+                try {
+                    reader.close();
+                } catch (IOException ignored) {
+                }
             }
         }
     }
 
     /**
-     * Executes the user-defined Reducer logic and persists the result to the output writer.
+     * Executes the user-defined {@link Reducer} logic and persists the result to the output writer.
+     *
      * @param key      The grouping key.
      * @param iterator Lazy-evaluating stream of values for the key.
      * @param reducer  The applied reduction logic.
@@ -240,6 +414,9 @@ public class ExternalMergeSorter {
      */
     @SuppressWarnings("ResultOfMethodCallIgnored")
     public static void cleanupDirectory(Path directoryToBeDeleted) {
+        if (directoryToBeDeleted == null || !Files.exists(directoryToBeDeleted)) {
+            return;
+        }
         try (Stream<Path> walk = Files.walk(directoryToBeDeleted)) {
             walk.sorted(Comparator.reverseOrder())
                     .map(Path::toFile)
@@ -251,7 +428,7 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue.
+     * Lazy-evaluating {@link Iterator} pulling values for a single key from the merge {@link PriorityQueue}.
      */
     private record StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) implements Iterator<String> {
 
@@ -262,13 +439,14 @@ public class ExternalMergeSorter {
 
         @Override
         public String next() {
-            if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
+            if (!hasNext()) {
+                throw new NoSuchElementException("No more values for key: " + currentKey);
+            }
 
             StreamNode minNode = pq.poll();
             assert minNode != null;
             String valueToReturn = minNode.currentValue;
 
-            // Zero-Allocation Advance: Mutate and reinsert the node
             try {
                 if (minNode.advance()) {
                     pq.add(minNode);
@@ -282,7 +460,7 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Internal data container representing an active file stream during a K-Way merge.
+     * Internal cursor representing an active run file stream during a K-way merge.
      */
     private static class StreamNode implements Comparable<StreamNode> {
         String currentKey;
@@ -294,15 +472,17 @@ public class ExternalMergeSorter {
         }
 
         boolean advance() throws IOException {
-            String line = reader.readLine();
-            if (line == null || line.isBlank()) {
-                return false;
-            }
-            int tabIndex = line.indexOf('\t');
-            if (tabIndex > 0) {
-                this.currentKey = line.substring(0, tabIndex);
-                this.currentValue = line.substring(tabIndex + 1);
-                return true;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                int tabIndex = line.indexOf('\t');
+                if (tabIndex > 0) {
+                    this.currentKey = line.substring(0, tabIndex);
+                    this.currentValue = line.substring(tabIndex + 1);
+                    return true;
+                }
             }
             return false;
         }

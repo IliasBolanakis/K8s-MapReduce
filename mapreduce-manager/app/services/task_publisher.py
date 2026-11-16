@@ -23,14 +23,16 @@ Zero-Trust Data Plane & O(1) Memory Partitioning:
 import hmac
 import hashlib
 import logging
-import itertools
 import asyncio
-from typing import Optional
+from typing import List, Optional, Tuple
 import aio_pika
 import aio_pika.abc
+from redis.asyncio import Redis
 
 from app.core.config import settings
+from app.core.redis import get_redis_client
 from app.models.schemas import TaskMessage, TaskType
+from app.repositories.cache_repository import CacheRepository
 from app.services import orchestrator
 
 # Initialize module-level logger for task distribution events
@@ -73,18 +75,18 @@ class TaskPublisher:
         mapper_obj: str,
         mapper_class: str,
         num_reducers: int,
-        mq_channel: aio_pika.RobustChannel,
+        mq_channel: aio_pika.abc.AbstractRobustChannel,
         combiner_obj: Optional[str] = None,
         combiner_class: Optional[str] = None,
-        file_format: str = "TEXT"
+        file_format: str = "TEXT",
+        redis_client: Optional[Redis] = None,
     ) -> None:
         """
-        Calculates data splits and broadcasts Map tasks to the worker cluster.
+        Calculates data splits, mints fenced attempt IDs, and broadcasts Map tasks.
 
-        Utilizes concurrent batch execution via `asyncio.gather`.
-        When publishing massive datasets (e.g., 100,000+ chunks),
-        this prevents the Python event loop from being bottlenecked by individual
-        network RTTs to the RabbitMQ broker, maximizing network throughput.
+        Utilizes pipelined Redis ``HINCRBY`` attempt minting (ADR-06) and concurrent
+        batch AMQP publishing via ``asyncio.gather`` in chunks of 1,000 tasks to
+        preserve O(1) memory while maximizing throughput.
 
         :param job_id: Unique identifier for the MapReduce job.
         :type job_id: str
@@ -103,16 +105,21 @@ class TaskPublisher:
         :param num_reducers: Target partition count for the shuffle phase.
         :type num_reducers: int
         :param mq_channel: The active RabbitMQ channel for message publication.
-        :type mq_channel: aio_pika.RobustChannel
+        :type mq_channel: aio_pika.abc.AbstractRobustChannel
         :param combiner_obj: Optional S3 key for the Combiner bytecode.
         :type combiner_obj: Optional[str]
         :param combiner_class: Optional fully qualified name of the Java Combiner class.
         :type combiner_class: Optional[str]
-        :raises Exception: If RabbitMQ publication or URI parsing fails.
+        :param file_format: Input serialization format (e.g., ``TEXT``, ``JSON``).
+        :type file_format: str
+        :param redis_client: Optional asynchronous Redis client for attempt minting.
+        :type redis_client: Optional[Redis]
+        :raises Exception: If RabbitMQ publication, Redis minting, or URI parsing fails.
         :return: None
         :rtype: None
         """
         try:
+            active_redis = redis_client or await get_redis_client()
             data_bucket, data_obj = orchestrator.parse_s3_uri(s3_input_uri)
 
             # Generate a consistent job token for the entire Map phase
@@ -131,52 +138,57 @@ class TaskPublisher:
             )
 
             # --- PERFORMANCE OPTIMIZATION: O(1) Memory Chunk Generation ---
-            # Instantiates the generator to sequentially stream task boundaries
-            # rather than buffering thousands of chunk calculations in memory.
             chunk_generator = orchestrator.generate_chunk_splits(file_size)
 
             BATCH_SIZE = 1000
-            publish_batch = []
+            chunk_batch: List[Tuple[str, int, int]] = []
+
+            async def _flush_batch(batch: List[Tuple[str, int, int]]) -> None:
+                task_ids = [tid for tid, _, _ in batch]
+                attempt_ids = await CacheRepository.mint_task_attempts_batch(
+                    job_id, task_ids, active_redis
+                )
+                publish_batch = []
+                for (tid, start_byte, byte_length), attempt_id in zip(batch, attempt_ids):
+                    task_msg = TaskMessage(
+                        task_id=tid,
+                        job_id=job_id,
+                        job_token=secure_job_token,
+                        task_type=TaskType.MAP,
+                        format=file_format,
+                        bucket_name=data_bucket,
+                        object_name=data_obj,
+                        byte_offset=start_byte,
+                        byte_length=byte_length,
+                        num_reducers=num_reducers,
+                        user_code_bucket=mapper_bucket,
+                        user_code_object=mapper_obj,
+                        class_name=mapper_class,
+                        combiner_code_object=combiner_obj,
+                        combiner_class_name=combiner_class,
+                        attempt_id=attempt_id,
+                    )
+                    publish_batch.append(
+                        mq_channel.default_exchange.publish(
+                            aio_pika.Message(
+                                body=task_msg.model_dump_json(by_alias=True).encode(),
+                                delivery_mode=aio_pika.DeliveryMode.NOT_PERSISTENT,
+                            ),
+                            routing_key=dynamic_queue_name,
+                        )
+                    )
+                await asyncio.gather(*publish_batch)
 
             for i, (start_byte, byte_length) in enumerate(chunk_generator):
-                task_msg = TaskMessage(
-                    task_id=f"map-chunk-{i}",
-                    job_id=job_id,
-                    job_token=secure_job_token,
-                    task_type=TaskType.MAP,
-                    format=file_format,
-                    bucket_name=data_bucket,
-                    object_name=data_obj,
-                    byte_offset=start_byte,
-                    byte_length=byte_length,
-                    num_reducers=num_reducers,
-                    user_code_bucket=mapper_bucket,
-                    user_code_object=mapper_obj,
-                    class_name=mapper_class,
-                    combiner_code_object=combiner_obj,
-                    combiner_class_name=combiner_class
-                )
+                chunk_batch.append((f"map-chunk-{i}", start_byte, byte_length))
 
-                # Architecture Update: TRANSIENT delivery mode eliminates heavy disk I/O
-                # Queue the coroutine without awaiting it immediately
-                publish_coro = mq_channel.default_exchange.publish(
-                    aio_pika.Message(
-                        body=task_msg.model_dump_json(by_alias=True).encode(),
-                        delivery_mode=aio_pika.DeliveryMode.NOT_PERSISTENT
-                    ),
-                    routing_key=dynamic_queue_name
-                )
-                publish_batch.append(publish_coro)
-
-                # Flush the batch to the broker concurrently when threshold is reached
-                if len(publish_batch) >= BATCH_SIZE:
-                    await asyncio.gather(*publish_batch)
-                    publish_batch.clear()
+                if len(chunk_batch) >= BATCH_SIZE:
+                    await _flush_batch(chunk_batch)
+                    chunk_batch.clear()
                     logger.debug(f"Broadcasted batch up to task {i + 1}/{total_chunks} to '{dynamic_queue_name}'.")
 
-            # Flush any remaining tasks in the final partial batch
-            if publish_batch:
-                await asyncio.gather(*publish_batch)
+            if chunk_batch:
+                await _flush_batch(chunk_batch)
                 logger.debug(f"Broadcasted final batch to '{dynamic_queue_name}'.")
 
             logger.info(f"Successfully published all {total_chunks} Map tasks with Auth Tokens (Transient/Batched).")
@@ -199,14 +211,15 @@ class TaskPublisher:
         mq_channel: aio_pika.abc.AbstractRobustChannel,
         combiner_obj: Optional[str] = None,
         combiner_class: Optional[str] = None,
-        file_format: str = "TEXT"
+        file_format: str = "TEXT",
+        redis_client: Optional[Redis] = None,
     ) -> None:
         """
         Republishes a specific Map task for surgical Lineage Recovery.
 
-        Invoked when a downstream Reducer signals a shuffle fetch failure. This method
-        re-calculates the exact byte-range for the missing chunk using the generator
-        and dispatches a replacement task to the cluster.
+        Computes the target chunk byte-range in O(1) time (ADR-05), mints a new
+        monotonic ``attempt_id`` (ADR-06) to fence any stale zombie execution,
+        and dispatches the replacement task to the cluster.
 
         :param job_id: UUID of the parent job.
         :type job_id: str
@@ -227,17 +240,23 @@ class TaskPublisher:
         :param num_reducers: Original reducer count.
         :type num_reducers: int
         :param mq_channel: Active RabbitMQ channel.
-        :type mq_channel: aio_pika.RobustChannel
+        :type mq_channel: aio_pika.abc.AbstractRobustChannel
         :param combiner_obj: Optional S3 key for the Combiner bytecode.
         :type combiner_obj: Optional[str]
         :param combiner_class: Optional fully qualified name of the Java Combiner class.
         :type combiner_class: Optional[str]
+        :param file_format: Input serialization format.
+        :type file_format: str
+        :param redis_client: Optional asynchronous Redis client for attempt minting.
+        :type redis_client: Optional[Redis]
         :raises ValueError: If the task_id format is invalid or out of bounds.
         :raises Exception: If republication fails.
         :return: None
         :rtype: None
         """
         try:
+            active_redis = redis_client or await get_redis_client()
+
             # Extract index from naming convention (e.g., map-chunk-5 -> 5)
             parts = task_id.split('-')
             if len(parts) < 3 or not parts[-1].isdigit():
@@ -246,19 +265,16 @@ class TaskPublisher:
             chunk_index = int(parts[-1])
 
             # Strict boundary validation using the passed total_chunks parameter
-            if chunk_index >= total_chunks:
+            if chunk_index < 0 or chunk_index >= total_chunks:
                 raise ValueError(f"Target chunk index {chunk_index} exceeds total chunks ({total_chunks}).")
 
             data_bucket, data_obj = orchestrator.parse_s3_uri(s3_input_uri)
 
-            # PERFORMANCE OPTIMIZATION: O(1) Memory Chunk Generation
-            # Fast-forward the generator safely using itertools to isolate the exact
-            # byte boundary for the requested target chunk.
-            chunk_generator = orchestrator.generate_chunk_splits(file_size)
-            try:
-                start_byte, byte_length = next(itertools.islice(chunk_generator, chunk_index, None))
-            except StopIteration:
-                raise ValueError(f"Target chunk index {chunk_index} is out of bounds for the calculated splits.")
+            # ADR-05: O(1) direct byte-offset arithmetic
+            start_byte, byte_length = orchestrator.get_chunk_split(chunk_index, file_size)
+
+            # ADR-06: Mint new monotonic attempt ID for zombie fencing
+            attempt_id = await CacheRepository.mint_task_attempt(job_id, task_id, active_redis)
 
             # Re-generate the cryptographic token for auth parity
             secure_job_token = _generate_job_token(job_id)
@@ -289,7 +305,8 @@ class TaskPublisher:
                 user_code_object=mapper_obj,
                 class_name=mapper_class,
                 combiner_code_object=combiner_obj,
-                combiner_class_name=combiner_class
+                combiner_class_name=combiner_class,
+                attempt_id=attempt_id,
             )
 
             # Architecture Update: TRANSIENT delivery mode eliminates heavy disk I/O
@@ -301,7 +318,13 @@ class TaskPublisher:
                 routing_key=dynamic_queue_name
             )
 
-            logger.warning(f"Lineage Recovery: Successfully republished targeted Map task '{task_id}' (Transient).")
+            logger.warning(
+                "Lineage Recovery: Republished Map task '%s' (attempt_id=%d, offset=%d, length=%d).",
+                task_id,
+                attempt_id,
+                start_byte,
+                byte_length,
+            )
 
         except Exception as e:
             logger.error(f"Failed to republish targeted Map task {task_id}: {str(e)}")

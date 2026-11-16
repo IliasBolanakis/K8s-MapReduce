@@ -11,6 +11,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileAttributeView;
 import java.nio.file.attribute.FileStoreAttributeView;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -18,6 +20,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -112,6 +115,96 @@ class StorageJanitorTest {
             } finally {
                 StorageJanitor.releaseJobLease(jobId);
             }
+        }
+    }
+
+    @Test
+    void stopAwaitsInFlightSpillWithoutInterruptingAndHaltsBeforeNextJob(@TempDir Path rootDir) throws Exception {
+        Path job1 = Files.createDirectories(rootDir.resolve("job-1/0"));
+        Files.writeString(job1.resolve("map-0.lz4"), "data-1");
+        Files.setAttribute(rootDir.resolve("job-1"), "creationTime", FileTime.from(Instant.now().minusSeconds(120)));
+
+        Path job2 = Files.createDirectories(rootDir.resolve("job-2/0"));
+        Files.writeString(job2.resolve("map-0.lz4"), "data-2");
+        Files.setAttribute(rootDir.resolve("job-2"), "creationTime", FileTime.from(Instant.now().minusSeconds(10)));
+
+        CountDownLatch spillStarted = new CountDownLatch(1);
+        CountDownLatch allowSpillFinish = new CountDownLatch(1);
+        AtomicBoolean spillWasInterrupted = new AtomicBoolean(false);
+        List<String> spilledJobs = new CopyOnWriteArrayList<>();
+
+        MinioStorageService slowSpillStorage = new MinioStorageService(DUMMY_CLIENT, "test-bucket", 2) {
+            @Override
+            public void spillJobData(String jobId, Path jobDirectory) throws IOException {
+                spilledJobs.add(jobId);
+                spillStarted.countDown();
+                try {
+                    assertTrue(allowSpillFinish.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    spillWasInterrupted.set(true);
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during spill", e);
+                }
+            }
+        };
+
+        FileStore highPressureStore = new FakeFileStore(1000L, 100L);
+        StorageJanitor.start(rootDir.toString(), slowSpillStorage, 10, 50, TimeUnit.MILLISECONDS, highPressureStore);
+        try (ExecutorService exec = Executors.newSingleThreadExecutor()) {
+            assertTrue(spillStarted.await(5, TimeUnit.SECONDS));
+
+            Future<Boolean> stopFuture = exec.submit(() -> StorageJanitor.stop(5, TimeUnit.SECONDS));
+            Thread.sleep(100);
+
+            assertFalse(StorageJanitor.isRunning(), "running flag must flip false immediately on stop()");
+            assertFalse(spillWasInterrupted.get(), "In-flight spillJobData must NOT be interrupted during graceful stop");
+            assertFalse(stopFuture.isDone(), "stop() must await completion of in-flight spill");
+
+            allowSpillFinish.countDown();
+            assertTrue(stopFuture.get(5, TimeUnit.SECONDS), "stop() should return true after clean cycle completion");
+            assertFalse(spillWasInterrupted.get());
+            assertEquals(List.of("job-1"), spilledJobs, "Janitor must finish job-1 and stop before starting job-2");
+            assertFalse(Files.exists(rootDir.resolve("job-1")), "Completed spill job-1 should be deleted locally");
+            assertTrue(Files.exists(rootDir.resolve("job-2")), "job-2 must remain untouched after stop signal");
+        } finally {
+            StorageJanitor.stop(1, TimeUnit.SECONDS);
+            slowSpillStorage.close();
+        }
+    }
+
+    @Test
+    void stopEscalatesToShutdownNowWhenSpillExceedsTimeout(@TempDir Path rootDir) throws Exception {
+        Path jobStuck = Files.createDirectories(rootDir.resolve("job-stuck/0"));
+        Files.writeString(jobStuck.resolve("map-0.lz4"), "stuck-data");
+
+        CountDownLatch spillStarted = new CountDownLatch(1);
+        CountDownLatch interruptedObserved = new CountDownLatch(1);
+
+        MinioStorageService hungSpillStorage = new MinioStorageService(DUMMY_CLIENT, "test-bucket", 1) {
+            @Override
+            public void spillJobData(String jobId, Path jobDirectory) throws IOException {
+                spillStarted.countDown();
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    interruptedObserved.countDown();
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted by shutdownNow", e);
+                }
+            }
+        };
+
+        FileStore highPressureStore = new FakeFileStore(1000L, 100L);
+        StorageJanitor.start(rootDir.toString(), hungSpillStorage, 10, 50, TimeUnit.MILLISECONDS, highPressureStore);
+        try {
+            assertTrue(spillStarted.await(5, TimeUnit.SECONDS));
+            boolean stoppedCleanly = StorageJanitor.stop(80, TimeUnit.MILLISECONDS);
+            assertFalse(stoppedCleanly, "stop() must return false when escalating to shutdownNow()");
+            assertTrue(interruptedObserved.await(5, TimeUnit.SECONDS), "shutdownNow() must interrupt stuck worker");
+            assertTrue(Files.exists(rootDir.resolve("job-stuck")), "Stuck/failed spill must never delete local data");
+        } finally {
+            StorageJanitor.stop(1, TimeUnit.SECONDS);
+            hungSpillStorage.close();
         }
     }
 

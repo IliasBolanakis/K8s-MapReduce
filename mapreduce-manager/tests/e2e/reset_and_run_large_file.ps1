@@ -22,13 +22,16 @@ Write-Host "`n[INFO] Purging previous cluster state and ensuring seeded infrastr
 kubectl rollout status deployment/manager-api -n $K8S_NAMESPACE --timeout=180s
 kubectl rollout status daemonset/external-shuffle-service -n $K8S_NAMESPACE --timeout=180s
 
-$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -WindowStyle Hidden
-$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -WindowStyle Hidden
+$pfMinio = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/minio-service", "19000:9000" -PassThru -NoNewWindow
+$pfMgr   = Start-Process -FilePath "kubectl" -ArgumentList "port-forward", "-n", $K8S_NAMESPACE, "svc/manager-service", "18000:8000" -PassThru -NoNewWindow
+
+$tmpDir = Join-Path $E2E_DIR ".tmp_e2e"
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
 try {
     Start-Sleep -Seconds 3
     $fileName = "wordcount_multichunk_200mb.txt"
-    $tmpFile = Join-Path $env:TEMP $fileName
+    $tmpFile = Join-Path $tmpDir $fileName
 
     Write-Host "`n[INFO] Generating >128MB multi-chunk dataset and uploading to MinIO..." -ForegroundColor Cyan
     $fileSize = & $PYTHON_EXE -c @"
@@ -85,4 +88,5 @@ print(written)
 } finally {
     if ($pfMinio -and -not $pfMinio.HasExited) { Stop-Process -Id $pfMinio.Id -Force }
     if ($pfMgr -and -not $pfMgr.HasExited) { Stop-Process -Id $pfMgr.Id -Force }
+    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
 }

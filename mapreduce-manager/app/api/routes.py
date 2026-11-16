@@ -261,6 +261,7 @@ async def handle_schedule_job(
             await k8s_provider.spawn_workers(job_id=job_id_str, replicas=replicas, phase="map")
 
             # Task Segment B: Publish Task Specifications (RabbitMQ Broker Integration)
+            await CacheRepository.cache_num_reducers(job_id_str, actual_reducers, redis_client)
             await TaskPublisher.publish_map_tasks(
                 job_id=job_id_str,
                 total_chunks=total_chunks,
@@ -273,7 +274,8 @@ async def handle_schedule_job(
                 mq_channel=mq_channel,
                 combiner_obj=combiner_obj,
                 combiner_class=derived_combiner_class,
-                file_format=payload.format
+                file_format=payload.format,
+                redis_client=redis_client,
             )
 
             # Task Segment C: Document Processing State & Commit Safe Results

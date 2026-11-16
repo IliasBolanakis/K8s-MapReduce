@@ -3,6 +3,7 @@
         <encoder class="net.logstash.logback.encoder.LogstashEncoder">
             <includeMdcKeyName>job_id</includeMdcKeyName>
             <includeMdcKeyName>task_id</includeMdcKeyName>
+            <includeMdcKeyName>attempt_id</includeMdcKeyName>
             <includeMdcKeyName>phase</includeMdcKeyName>
         </encoder>
     </appender>
